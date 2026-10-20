@@ -23,6 +23,17 @@ export function createBot(config: Config): Bot {
   })
 
   bot.loadPlugin(pathfinder)
+
+  // 26.3 servers require client_tick_end after every position packet
+  const origWrite = bot._client.write.bind(bot._client)
+  ;(bot._client as any).write = (name: string, packet: any) => {
+    const result = origWrite(name, packet)
+    if (name === 'position' || name === 'position_look' || name === 'look' || name === 'flying') {
+      try { origWrite('tick_end', {}) } catch {}
+    }
+    return result
+  }
+
   installDiagnostics(bot, config.diagnostics)
 
   // Internal plugins are injected once the version is known; patch them after that.

@@ -6,25 +6,23 @@ import { ToolRegistry } from '../tools/registry.js'
 import { TaskCancelledError, errorMessage } from '../util/async.js'
 import { createLogger } from '../util/logger.js'
 import { LlmClient, Message } from './llm.js'
-import { buildSystemPrompt, buildUserMessage } from './prompt.js'
+import { buildSystemPrompt, buildUserMessage, guideCatalog, renderGuideSections } from './prompt.js'
 
 const log = createLogger('agent')
-
-/** Tool output beyond this is cut so one verbose result can't flood the context window. */
 const maxToolOutput = 2000
-/** Past request/reply pairs kept so follow-ups like "do it again" make sense. */
 const historyTurns = 6
 
-export type AgentRequest = {
-  username: string
-  message: string
-}
+/** Tools whose `block` argument sets the active search target for surroundings. */
+const SEARCH_TOOLS = new Set(['find_blocks', 'collect_block', 'go_to_block'])
+
+export type AgentRequest = { username: string; message: string }
 
 export class Agent {
   private readonly queue: AgentRequest[] = []
   private readonly history: Message[] = []
   private controller: AbortController | null = null
-  private systemPrompt: string | null = null
+  /** Selection-stage prompt: rules + catalog + guide heading list, no guide bodies. */
+  private selectPrompt: string | null = null
 
   constructor(
     private readonly bot: Bot,
@@ -46,7 +44,6 @@ export class Agent {
     void this.drain()
   }
 
-  /** Cancel the running task and everything queued behind it. */
   cancel(): boolean {
     const hadWork = this.busy || this.queue.length > 0
     this.queue.length = 0
@@ -77,23 +74,45 @@ export class Agent {
 
   private async run(request: AgentRequest, signal: AbortSignal) {
     log.info(`${request.username}: ${request.message}`)
-    this.systemPrompt ??= buildSystemPrompt(this.bot.username, this.registry)
+    this.selectPrompt ??= buildSystemPrompt(this.bot.username, this.registry, guideCatalog())
 
+    let searchTarget: string | null = null
     const userMessage: Message = {
       role: 'user',
-      content: buildUserMessage(request.username, request.message, describeWorldState(this.bot))
+      content: buildUserMessage(request.username, request.message, describeWorldState(this.bot, searchTarget))
     }
     const messages: Message[] = [
-      { role: 'system', content: this.systemPrompt },
+      { role: 'system', content: this.selectPrompt },
       ...this.history,
       userMessage
     ]
     const tools = this.registry.toOllamaTools()
     const ctx = { bot: this.bot, signal, log, requester: request.username }
 
+    let chosenSections: string[] = []
     let reply = ''
     let step = 0
+    let switched = false
+
     for (; step < this.config.maxSteps; step++) {
+      if (step === 1 && !switched) {
+        const executePrompt = buildSystemPrompt(
+          this.bot.username,
+          this.registry,
+          renderGuideSections(chosenSections)
+        )
+        messages[0] = { role: 'system', content: executePrompt }
+        switched = true
+        log.info(`Guide sections loaded: ${chosenSections.join(', ') || 'FULL (model did not call select_guide)'}`)
+      }
+
+      // Refresh the user message so the model sees current surroundings every turn.
+      userMessage.content = buildUserMessage(
+        request.username,
+        request.message,
+        describeWorldState(this.bot, searchTarget)
+      )
+
       const response = await this.llm.chat(messages, tools)
       if (signal.aborted) throw new TaskCancelledError()
       messages.push(response)
@@ -106,6 +125,24 @@ export class Agent {
 
       for (const call of calls) {
         const name = call.function.name
+        if (name === 'select_guide') {
+          const raw = String((call.function.arguments as any)?.sections ?? '')
+          chosenSections = raw.split(',').map(s => s.trim()).filter(Boolean)
+          log.info(`LLM selected guide sections: ${chosenSections.join(', ') || '(none)'}`)
+          messages.push({
+            role: 'tool',
+            tool_name: name,
+            content: `Loaded guide sections: ${chosenSections.join(', ') || '(none — full guide will be used)'}`
+          })
+          continue
+        }
+
+        // Track the active search target so surroundings include the nearest blocks.
+        const args = (call.function.arguments ?? {}) as Record<string, unknown>
+        if (SEARCH_TOOLS.has(name) && typeof args.block === 'string' && args.block.trim()) {
+          searchTarget = args.block.trim()
+        }
+
         log.info(`→ ${name} ${JSON.stringify(call.function.arguments)}`)
         const started = Date.now()
         const outcome = await this.registry.execute({ name, arguments: call.function.arguments }, ctx)
@@ -120,11 +157,9 @@ export class Agent {
       reply = `I stopped after ${this.config.maxSteps} steps without finishing. Tell me how to continue.`
     }
     if (reply) this.bot.chat(reply.slice(0, 256))
-
     this.remember(request, reply)
   }
 
-  /** Keep a compact record: the request without the bulky state dump, and the final reply. */
   private remember(request: AgentRequest, reply: string) {
     this.history.push(
       { role: 'user', content: `${request.username} says: ${request.message}` },

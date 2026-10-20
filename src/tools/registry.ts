@@ -58,7 +58,8 @@ export class ToolRegistry {
       byCategory.set(tool.category, [...(byCategory.get(tool.category) ?? []), tool])
     }
     return [...byCategory.entries()].map(([category, tools]) =>
-      `${category}: ${tools.map(t => t.name).join(', ')}`).join('\n')
+      `${category}:\n` + tools.map(t => `- ${t.name}: ${t.description}`).join('\n')
+    ).join('\n\n')
   }
 
   /**
@@ -86,6 +87,7 @@ export class ToolRegistry {
 export function createToolRegistry(): ToolRegistry {
   return new ToolRegistry([
     ...communicationTools,
+    ...planningTools,
     ...perceptionTools,
     ...movementTools,
     ...gatheringTools,

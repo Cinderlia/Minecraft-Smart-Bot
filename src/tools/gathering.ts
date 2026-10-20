@@ -10,6 +10,54 @@ import { defineTool, positionParams, readPosition } from './types.js'
 
 const category = 'Gathering'
 
+/** Radius around the bot to search for diggable blocks when reporting suggestions. */
+const DIG_SUGGEST_RADIUS = 4
+const DIG_SUGGEST_LIMIT = 12
+
+/** Blocks that are never worth suggesting as dig targets. */
+const NOT_DIGGABLE = new Set([
+  'air', 'cave_air', 'void_air',
+  'water', 'flowing_water', 'bubble_column',
+  'lava', 'flowing_lava',
+  'bedrock'
+])
+
+type DigSpot = { x: number; y: number; z: number; name: string }
+
+/**
+ * Find absolute coordinates of blocks around the bot that can be dug.
+ * Used to steer the model toward real coordinates on a failed dig.
+ */
+function findDiggableSpots(bot: Bot, radius = DIG_SUGGEST_RADIUS, limit = DIG_SUGGEST_LIMIT): DigSpot[] {
+  const p = bot.entity?.position
+  if (!p) return []
+  const bx = Math.floor(p.x), by = Math.floor(p.y), bz = Math.floor(p.z)
+  const out: DigSpot[] = []
+  for (let dy = -2; dy <= 3 && out.length < limit; dy++) {
+    for (let dx = -radius; dx <= radius && out.length < limit; dx++) {
+      for (let dz = -radius; dz <= radius && out.length < limit; dz++) {
+        if (dx === 0 && dz === 0 && (dy === 0 || dy === 1)) continue
+        const x = bx + dx, y = by + dy, z = bz + dz
+        const block = bot.blockAt(new Vec3(x, y, z))
+        if (!block) continue
+        if (NOT_DIGGABLE.has(block.name)) continue
+        out.push({ x, y, z, name: block.name })
+      }
+    }
+  }
+  return out
+}
+
+function formatDigSpots(spots: DigSpot[]): string {
+  return spots.map(s => `(${s.x}, ${s.y}, ${s.z}) ${s.name}`).join(', ')
+}
+
+function digSpotHint(bot: Bot, prefix: string): string {
+  const spots = findDiggableSpots(bot)
+  if (spots.length === 0) return `${prefix} No diggable blocks nearby; move to another area.`
+  return `${prefix} Nearby diggable blocks: ${formatDigSpots(spots)}. Pick one of these coordinates from Terrain instead of guessing.`
+}
+
 /** Walk over dropped items near `around` so they get picked up. */
 export async function pickUpDrops(bot: Bot, around: Vec3, radius: number, signal: AbortSignal): Promise<number> {
   await sleep(250, signal)
@@ -60,8 +108,10 @@ export const gatheringTools = [
     name: 'collect_block',
     category,
     description:
-      'Find, walk to, mine and pick up blocks of a type. Picks the best tool automatically. ' +
-      'Accepts families: "log"/"wood" (any tree), "stone" (drops cobblestone), "iron"/"coal"/"diamond" (ores incl. deepslate), "sand", "dirt".',
+      'Find, walk to, mine and pick up blocks of a type — use when the player wants to KEEP the block (gather wood, stone, dirt to build with). ' +
+      'Picks the best tool automatically. ' +
+      'Accepts families: "log"/"wood" (any tree), "stone" (drops cobblestone), "iron"/"coal"/"diamond" (ores incl. deepslate), "sand", "dirt". ' +
+      'Do NOT use this to CLEAR/REMOVE blocks from an existing structure — for that, read the Terrain section to find their coordinates and call dig_block.',
     params: {
       block: { type: 'string', description: 'Block name or family to mine', required: true },
       count: { type: 'integer', description: 'How many blocks to mine (default 1, max 64)' },
@@ -116,14 +166,27 @@ export const gatheringTools = [
   defineTool({
     name: 'dig_block',
     category,
-    description: 'Break the single block at coordinates (and pick up its drop).',
-    params: positionParams('the block to break'),
+    description:
+      'Break the SINGLE block at absolute coordinates and pick up its drop. Use this when the player wants a block GONE (clear / remove / clean / dig out / break / destroy / empty / open up). ' +
+      'ALWAYS compute the target coordinate from the Terrain section of Current state: Terrain lists solid blocks as absolute-coordinate boxes and their air holes. Pick a coordinate that Terrain shows as that block type; do not guess or sweep coordinates one by one. ' +
+      'Use this for a specific block (a door opening, clearing dirt inside a room), not for gathering many — use collect_block for that. ' +
+      'On failure ("No block at X" or "cannot be broken") the result lists nearby diggable blocks; pick one of those coordinates from Terrain instead of guessing. ' +
+      'Do NOT dig to make room for building — re-read Terrain and pick an empty spot.',
+    params: positionParams('absolute coordinates of the block to break'),
     async handler(args, { bot, signal }) {
       const pos = readPosition(args)
       const before = snapshotInventory(bot)
-      const name = await digAt(bot, pos, signal)
-      await pickUpDrops(bot, pos, 5, signal)
-      return `Broke ${name} at ${formatPos(pos)}. Inventory change: ${describeInventoryChange(before, snapshotInventory(bot))}`
+      try {
+        const name = await digAt(bot, pos, signal)
+        await pickUpDrops(bot, pos, 5, signal)
+        const change = describeInventoryChange(before, snapshotInventory(bot))
+        const hint = digSpotHint(bot, '')
+        return `Broke ${name} at ${formatPos(pos)}. Inventory change: ${change}.${hint}`
+      } catch (error) {
+        if (error instanceof TaskCancelledError) throw error
+        const hint = digSpotHint(bot, '')
+        throw new ToolInputError(`${errorMessage(error)}.${hint}`)
+      }
     }
   }),
 

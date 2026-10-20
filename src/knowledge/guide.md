@@ -75,3 +75,5 @@
 - Keep chat short (one or two sentences). For long tasks, a brief progress `say` every few steps is welcome.
 - When you are done, reply with a short final summary — it is sent to chat automatically, so don't also `say` the same thing.
 - If a request is impossible or unclear, say what's missing or ask a short question.
+
+## When stuck

@@ -12,8 +12,8 @@ export type Config = {
     profilesFolder: string
   }
   owners: {
-    minecraft: string
-    discord: string | null
+    minecraft: string[]
+    discord: string[] | null
   }
   llm: {
     host: string
@@ -57,6 +57,19 @@ function bool(name: string, fallback: boolean): boolean {
   return ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase())
 }
 
+/** Parse a comma-separated list; whitespace trimmed, empty entries dropped. */
+function list(name: string, fallback: string[] = []): string[] {
+  const raw = optional(name)
+  if (raw === undefined) return fallback
+  return raw.split(',').map(s => s.trim()).filter(Boolean)
+}
+
+function requiredList(name: string): string[] {
+  const values = list(name)
+  if (values.length === 0) throw new Error(`Missing required environment variable ${name}`)
+  return values
+}
+
 function think(model: string): ThinkSetting {
   const raw = optional('OLLAMA_THINK')?.toLowerCase()
   // gpt-oss cannot fully disable reasoning; it only accepts levels.
@@ -89,7 +102,7 @@ export function loadConfig(): Config {
       profilesFolder: path.resolve(process.cwd(), '.auth-cache')
     },
     owners: {
-      minecraft: required('MC_OWNER'),
+      minecraft: requiredList('MC_OWNER'),
       discord: optional('DISCORD_OWNER') ?? null
     },
     llm: {

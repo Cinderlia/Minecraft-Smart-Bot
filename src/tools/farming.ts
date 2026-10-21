@@ -27,6 +27,9 @@ const crops: Record<string, CropInfo> = {
   sweet_berry_bush: { kind: 'berry' }
 }
 
+/** Valid seed item ids the bot can plant. */
+const VALID_SEEDS = [...new Set(Object.values(crops).map(c => c.seed).filter((s): s is string => !!s))]
+
 function maxAge(bot: Bot, name: string): number | null {
   const age = bot.registry.blocksByName[name]?.states?.find((s: { name: string }) => s.name === 'age')
   return age ? (age.num_values ?? 1) - 1 : null
@@ -42,7 +45,7 @@ function isRipe(bot: Bot, block: Block | null, wanted: Set<string>): boolean {
   const info = crops[block.name]
   if (info.kind === 'block') return true
   if (info.kind === 'cane') {
-    if (!block.position) return true // palette pre-check has no position; the full check below decides
+    if (!block.position) return true
     return bot.blockAt(block.position.offset(0, -1, 0))?.name === 'sugar_cane'
   }
   const max = maxAge(bot, block.name)
@@ -71,7 +74,6 @@ async function plantOn(bot: Bot, soil: Block, seed: string): Promise<boolean> {
   try {
     await bot.placeBlock(soil, new Vec3(0, 1, 0))
   } catch {
-    // placeBlock can time out waiting for the update even though planting worked; verify below.
     await sleep(200)
   }
   return bot.blockAt(soil.position.offset(0, 1, 0))?.name !== 'air'
@@ -137,7 +139,6 @@ export const farmingTools = [
               else if (countItem(bot, info.seed) === 0) missingSeeds.add(info.seed)
             }
           }
-          // Drops scatter a little; sweep up nearby ones every few harvests rather than after each.
           const total = [...harvested.values()].reduce((a, b) => a + b, 0)
           if (total % 6 === 0) await pickUpDrops(bot, target, 5, signal)
         } catch (error) {
@@ -168,9 +169,12 @@ export const farmingTools = [
   defineTool({
     name: 'plant_seeds',
     category,
-    description: 'Plant seeds (wheat_seeds, carrot, potato, beetroot_seeds, nether_wart) on every empty farmland/soul sand nearby.',
+    description:
+      'Plant seeds on every empty farmland/soul sand nearby. Valid seed items: ' + VALID_SEEDS.join(', ') + '. ' +
+      'Note: carrots use the item "carrot" (not "carrot_seeds"); potatoes use "potato". ' +
+      'Requires farmland next to water — till dirt with a hoe first (use_item_on_block).',
     params: {
-      seed: { type: 'string', description: 'Seed item to plant (default: whatever seeds are in the inventory)' },
+      seed: { type: 'string', description: `Seed item to plant (one of: ${VALID_SEEDS.join(', ')}; omit for any available seeds)` },
       radius: { type: 'number', description: 'Search radius in blocks (default 16)' }
     },
     async handler(args, { bot, signal, log }) {
@@ -178,7 +182,10 @@ export const farmingTools = [
       const requested = args.optionalString('seed')?.toLowerCase().replace(/\s+/g, '_')
       const options = seedCrops.filter(c => (requested ? c.seed === requested : countItem(bot, c.seed!) > 0))
       if (options.length === 0) {
-        throw new ToolInputError(requested ? `${requested} is not a plantable seed` : 'No seeds in inventory (wheat_seeds, carrot, potato, beetroot_seeds, nether_wart)')
+        const hint = requested
+          ? `"${requested}" is not a plantable seed. Valid: ${VALID_SEEDS.join(', ')}. (Carrots use "carrot", not "carrot_seeds".)`
+          : `No seeds in inventory. Valid: ${VALID_SEEDS.join(', ')}.`
+        throw new ToolInputError(hint)
       }
       const radius = args.optionalNumber('radius', { min: 2, max: 48 }) ?? 16
       const soils = new Set(options.flatMap(c => c.soil!))
@@ -203,7 +210,9 @@ export const farmingTools = [
           skipped.add(spot.toString())
         }
       }
-      return planted > 0 ? `Planted ${planted} seed(s).` : 'No empty farmland to plant on (till dirt next to water with a hoe first: use_item_on_block).'
+      return planted > 0
+        ? `Planted ${planted} seed(s).`
+        : 'No empty farmland to plant on (till dirt next to water with a hoe first: use_item_on_block).'
     }
   })
 ]

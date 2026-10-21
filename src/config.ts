@@ -13,13 +13,14 @@ export type Config = {
   }
   owners: {
     minecraft: string[]
-    discord: string[] | null
+    discord: string[]
   }
   llm: {
     host: string
     model: string
     think: ThinkSetting
     numCtx: number
+    apiKey: string | undefined
   }
   agent: {
     maxSteps: number
@@ -103,13 +104,14 @@ export function loadConfig(): Config {
     },
     owners: {
       minecraft: requiredList('MC_OWNER'),
-      discord: optional('DISCORD_OWNER') ?? null
+      discord: list('DISCORD_OWNER')
     },
     llm: {
       host: optional('OLLAMA_HOST') ?? 'http://127.0.0.1:11434',
       model,
       think: think(model),
-      numCtx: int('OLLAMA_NUM_CTX', 16384)
+      numCtx: int('OLLAMA_NUM_CTX', 16384),
+      apiKey: optional('OLLAMA_API_KEY')
     },
     agent: {
       maxSteps: int('AGENT_MAX_STEPS', 40),

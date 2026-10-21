@@ -1,12 +1,12 @@
 import { Bot } from 'mineflayer'
 import { stopAllMovement } from '../bot/navigation.js'
-import { describeWorldState } from '../bot/status.js'
 import { Config } from '../config.js'
 import { ToolRegistry } from '../tools/registry.js'
 import { TaskCancelledError, errorMessage } from '../util/async.js'
 import { createLogger } from '../util/logger.js'
 import { LlmClient, Message } from './llm.js'
 import { buildSystemPrompt, buildUserMessage, guideCatalog, renderGuideSections } from './prompt.js'
+import { describeSurroundings, describeWorldState } from '../bot/status.js'
 
 const log = createLogger('agent')
 const maxToolOutput = 2000

@@ -1,6 +1,7 @@
 import { Bot } from 'mineflayer'
 import { LlmClient, Message } from './llm.js'
 import { createLogger } from '../util/logger.js'
+import { ChatHistory } from '../chat/history.js'
 
 const log = createLogger('chat')
 
@@ -28,7 +29,11 @@ export type ChatContext = {
  * Uses its own LlmClient so it never aborts or blocks the agent's planning.
  */
 export class ChatSpeaker {
-  constructor(private readonly bot: Bot, private readonly llm: LlmClient) {}
+  constructor(
+    private readonly bot: Bot,
+    private readonly llm: LlmClient,
+    private readonly history?: ChatHistory
+  ) {}
 
   /** Fire-and-forget: never awaits the LLM in the caller's task loop. */
   speak(userMessage: string, ctx: ChatContext): void {
@@ -38,6 +43,8 @@ export class ChatSpeaker {
         if (line) {
           log.info(`→ ${line}`)
           this.bot.chat(line.slice(0, 200))
+          // Record the bot's own line so the language loop sees what was already said.
+          this.history?.add('bot', this.bot.username, line)
         } else {
           log.warn('Chat generation returned empty; nothing sent')
         }

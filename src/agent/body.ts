@@ -13,35 +13,45 @@ import { stopAllMovement } from '../bot/navigation.js'
 
 const log = createLogger('body')
 
-export type TaskPriority = number // higher = more urgent
+export type TaskPriority = number
 
 export type QueuedTask = {
   id: string
   rawRequest: string
   username: string
   priority: TaskPriority
-  /** Index of the next planned step to run (0 = not started). */
   progress: number
   plan?: Plan
   controller?: AbortController
   state: 'queued' | 'running' | 'suspended' | 'done' | 'failed' | 'cancelled'
 }
 
+export type ChatIntent = { taskId: string; reason: string; intent: string }
+export type IntentSink = (intent: ChatIntent) => void
+
+export type BodySnapshot = {
+  current: { id: string; request: string; description: string; progress: string } | null
+  queued: { id: string; request: string; description: string; priority: number; progress: string }[]
+}
+
 const AUTONOMIC_TASK_ID = '__autonomic__'
 const AUTONOMIC_PRIORITY = Number.MIN_SAFE_INTEGER
+const AUTONOMIC_LOG_INTERVAL_MS = 60_000
 
 export class BodyLoop {
   private queue: QueuedTask[] = []
   private current: QueuedTask | null = null
   private preempt = false
   private running = false
+  private lastAutonomicLog = 0
 
   constructor(
     private readonly bot: Bot,
     private readonly registry: ToolRegistry,
     private readonly llm: LlmClient,
     private readonly config: Config['agent'],
-    private readonly speaker?: ChatSpeaker
+    private readonly speaker?: ChatSpeaker,
+    private readonly intentSink?: IntentSink
   ) {
     this.queue.push({
       id: AUTONOMIC_TASK_ID,
@@ -53,17 +63,20 @@ export class BodyLoop {
     })
   }
 
-  snapshot(): {
-    current: { id: string; request: string; progress: number } | null
-    queued: { id: string; request: string; priority: number; progress: number }[]
-  } {
+  snapshot(): BodySnapshot {
+    const describe = (t: QueuedTask) => {
+      const description = t.plan?.goal ?? '(not planned yet)'
+      const progress = t.plan ? `${t.progress}/${t.plan.tasks.length}` : 'unplanned'
+      return { description, progress }
+    }
     return {
-      current: this.current && this.current.id !== AUTONOMIC_TASK_ID
-        ? { id: this.current.id, request: this.current.rawRequest, progress: this.current.progress }
-        : null,
+      current:
+        this.current && this.current.id !== AUTONOMIC_TASK_ID
+          ? { id: this.current.id, request: this.current.rawRequest, ...describe(this.current) }
+          : null,
       queued: this.queue
         .filter(t => t.id !== AUTONOMIC_TASK_ID)
-        .map(t => ({ id: t.id, request: t.rawRequest, priority: t.priority, progress: t.progress }))
+        .map(t => ({ id: t.id, request: t.rawRequest, priority: t.priority, ...describe(t) }))
     }
   }
 
@@ -134,7 +147,7 @@ export class BodyLoop {
       return b.priority - a.priority
     })
   }
-  private lastAutonomicLog = 0
+
   private async pump() {
     if (this.running) return
     this.running = true
@@ -144,16 +157,15 @@ export class BodyLoop {
         const head = this.queue[0]
         this.current = head
 
-        // 在 pump 的 autonomic 分支里
         if (head.id === AUTONOMIC_TASK_ID) {
-            this.current = null
-            const now = Date.now()
-            if (now - this.lastAutonomicLog > 60_000) {
-                this.lastAutonomicLog = now
-                log.info(`[autonomic] idle — no tasks queued, running self-maintenance tick`)
-            }
-            await new Promise(r => setTimeout(r, 500))
-            continue
+          this.current = null
+          const now = Date.now()
+          if (now - this.lastAutonomicLog > AUTONOMIC_LOG_INTERVAL_MS) {
+            this.lastAutonomicLog = now
+            log.info(`[autonomic] idle — no tasks queued, running self-maintenance tick`)
+          }
+          await new Promise(r => setTimeout(r, 500))
+          continue
         }
 
         head.state = 'running'
@@ -195,6 +207,15 @@ export class BodyLoop {
       for (const s of task.plan.tasks) {
         log.info(`  [task ${task.id} step ${s.id}] deps=[${s.depends_on.join(',')}] ${s.description}`)
       }
+    }
+
+    // Tell the language loop the task started so the player hears about it.
+    if (this.intentSink) {
+      this.intentSink({
+        taskId: task.id,
+        reason: 'task started',
+        intent: `Just started handling: "${task.rawRequest}". Plan: ${task.plan.goal}. Tell the player in one short line.`
+      })
     }
 
     const plan = task.plan
@@ -246,11 +267,13 @@ export class BodyLoop {
 
     const summary = plan.tasks.map(s => `[${s.id}] ${results.get(s.id) ?? 'skipped'}`).join(' | ').slice(0, 240)
     log.info(`[task ${task.id}] summary: ${summary}`)
-    if (this.speaker) {
-      const ok = [...results.values()].filter(r => !r.startsWith('failed') && !r.startsWith('partial') && !r.startsWith('needs_revision')).length
-      this.speaker.speak(task.rawRequest, {
-        busyWith: null,
-        report: plan.tasks.length <= 1 ? summary : `${ok}/${plan.tasks.length} 步完成。${summary}`
+
+    // Task finished: ask the language loop to report the outcome.
+    if (this.intentSink) {
+      this.intentSink({
+        taskId: task.id,
+        reason: 'task finished',
+        intent: `Just finished: "${task.rawRequest}". Outcome: ${summary}. Tell the player in one short line.`
       })
     }
   }
@@ -261,7 +284,27 @@ export class BodyLoop {
     const stepText = `${step.description}\n\nDone when: ${step.done_when}${step.needs.length > 0 ? `\nItems needed: ${step.needs.join(', ')}` : ''}`
     const userMessage = { role: 'user' as const, content: buildUserMessage(parent.username, stepText, describeWorldState(this.bot, searchTarget)) }
     const messages = [{ role: 'system' as const, content: executePrompt }, userMessage]
-    const tools = this.registry.toOllamaTools()
+
+    // In task mode the bot cannot `say` directly; it must request a chat via the
+    // language loop so the persona and recent context stay consistent.
+    const tools = this.registry.toOllamaTools().filter(t => t.function.name !== 'say')
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'request_chat',
+        description:
+          'Ask the language loop to say something to the player. Describe WHY and WHAT, not the exact words. Non-blocking.',
+        parameters: {
+          type: 'object',
+          required: ['reason', 'intent'],
+          properties: {
+            reason: { type: 'string', description: 'Why you need to speak (e.g. "task started", "task finished", "got stuck")' },
+            intent: { type: 'string', description: 'What to convey, in a short summary' }
+          }
+        }
+      }
+    } as any)
+
     const ctx = { bot: this.bot, signal, log, requester: parent.username }
     const toolLog: string[] = []
     let reply = ''
@@ -283,6 +326,19 @@ export class BodyLoop {
         const name = call.function.name
         if (name === 'select_guide') {
           messages.push({ role: 'tool', tool_name: name, content: `Guide sections are fixed by the planner: ${step.guide_sections.join(', ') || 'none'}.` } as any)
+          continue
+        }
+        if (name === 'say') {
+          messages.push({ role: 'tool', tool_name: name, content: 'In task mode use request_chat instead of say.' } as any)
+          continue
+        }
+        if (name === 'request_chat') {
+          const args = (call.function.arguments ?? {}) as Record<string, any>
+          const reason = String(args.reason ?? '')
+          const intent = String(args.intent ?? '')
+          log.info(`[task ${parent.id} step ${step.id} turn ${turn}] request_chat reason="${reason}" intent="${intent}"`)
+          if (this.intentSink) this.intentSink({ taskId: parent.id, reason, intent })
+          messages.push({ role: 'tool', tool_name: name, content: 'Chat request queued (non-blocking).' } as any)
           continue
         }
         const args = (call.function.arguments ?? {}) as Record<string, unknown>
@@ -325,7 +381,12 @@ export class BodyLoop {
     if (verdict.status === 'failed') return `failed: ${verdict.reason}`
     if (!verdict.revised_task) return `needs_revision: ${verdict.reason}`
     if (depth >= 2) return `needs_revision (gave up): ${verdict.reason}`
-    log.info(`[task ${parent.id} step ${step.id}] revised (depth ${depth + 1}/2): ${verdict.revised_task.description?.slice(0, 120) ?? ''}`)
-    return this.runPlannedStep({ ...step, description: verdict.revised_task.description ?? step.description, done_when: verdict.revised_task.done_when ?? step.done_when }, parent, signal, depth + 1)
+    log.info(`[task ${parent.id} step ${step.id}] revised (depth ${depth + 1}/2)`)
+    return this.runPlannedStep(
+      { ...step, description: verdict.revised_task.description ?? step.description, done_when: verdict.revised_task.done_when ?? step.done_when },
+      parent,
+      signal,
+      depth + 1
+    )
   }
 }

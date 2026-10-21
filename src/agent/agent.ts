@@ -224,7 +224,16 @@ export class Agent {
       return verdict.reason || reply || 'done'
     }
     if (verdict.status === 'partial') {
-      return `partial: ${verdict.reason}`
+      if (depth >= maxRevisions) {
+        return `partial (gave up after ${maxRevisions} retries): ${verdict.reason}`
+      }
+      log.info(`Task ${task.id} partial, retrying with hint: ${verdict.reason}`)
+      return this.runTask(
+        { ...task, description: `${task.description}\n\nPrevious attempt was partial: ${verdict.reason}\nAddress the missing part before finishing.` },
+        request,
+        signal,
+        depth + 1
+      )
     }
     if (verdict.status === 'failed') {
       return `failed: ${verdict.reason}`

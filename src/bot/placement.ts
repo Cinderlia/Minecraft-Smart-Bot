@@ -1,6 +1,6 @@
 import { Bot } from 'mineflayer'
 import { Block } from 'prismarine-block'
-import { goals } from 'mineflayer-pathfinder'
+import { goals } from './goals.js'
 import { Vec3 } from 'vec3'
 import { ToolInputError } from '../tools/args.js'
 import { errorMessage, sleep } from '../util/async.js'

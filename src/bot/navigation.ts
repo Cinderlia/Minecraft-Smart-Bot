@@ -1,51 +1,47 @@
 import { Bot } from 'mineflayer'
-import { Movements, goals } from 'mineflayer-pathfinder'
 import { Vec3 } from 'vec3'
 import { TaskCancelledError, errorMessage } from '../util/async.js'
+import { goals } from './goals.js'
 
 /**
- * Two movement profiles: normal travel never breaks blocks (so the bot does not
- * wreck builds), while resource gathering may dig through terrain.
+ * Travel by default never breaks blocks, so the bot walks around builds.
+ * Only tasks that explicitly need to dig through terrain (collect_block,
+ * go_to_block on a buried target) opt in with allowDig: true.
  */
-const profiles = new WeakMap<Bot, { travel: Movements; dig: Movements }>()
-
 export function configureMovements(bot: Bot) {
-  const travel = new Movements(bot)
-  travel.canDig = false
-  travel.allow1by1towers = false
-  travel.allowParkour = true
-  travel.allowSprinting = true
-
-  const dig = new Movements(bot)
-  dig.canDig = true
-  dig.allow1by1towers = true
-  dig.allowParkour = true
-  dig.allowSprinting = true
-
-  profiles.set(bot, { travel, dig })
-  bot.pathfinder.setMovements(travel)
+  // Baritone config is global; navigate() toggles breakBlocks per call.
+  bot.ashfinder.config.parkour = true
+  bot.ashfinder.config.breakBlocks = false
+  bot.ashfinder.config.placeBlocks = false
+  bot.ashfinder.config.swimming = true
 }
 
 export type NavigateOptions = {
+  /** Allow digging through blocks on the way. Default false. */
   allowDig?: boolean
   signal: AbortSignal
 }
 
 export async function navigate(bot: Bot, goal: goals.Goal, options: NavigateOptions): Promise<void> {
-  const profile = profiles.get(bot)
-  if (profile) bot.pathfinder.setMovements(options.allowDig ? profile.dig : profile.travel)
+  const allowDig = options.allowDig === true
+  const previousBreak = bot.ashfinder.config.breakBlocks
+  const previousPlace = bot.ashfinder.config.placeBlocks
+  bot.ashfinder.config.breakBlocks = allowDig
+  // Only let it pillar/bridge when digging is allowed; otherwise stay on solid ground.
+  bot.ashfinder.config.placeBlocks = allowDig
 
-  const onAbort = () => bot.pathfinder.stop()
+  const onAbort = () => bot.ashfinder.stop()
   options.signal.addEventListener('abort', onAbort, { once: true })
 
   try {
-    await bot.pathfinder.goto(goal)
+    await bot.ashfinder.gotoSmart(goal, { waypointThreshold: 75, forceAdaptive: true })
   } catch (error) {
     if (options.signal.aborted) throw new TaskCancelledError()
     throw new Error(`Could not reach destination: ${errorMessage(error)}`)
   } finally {
     options.signal.removeEventListener('abort', onAbort)
-    if (profile) bot.pathfinder.setMovements(profile.travel)
+    bot.ashfinder.config.breakBlocks = previousBreak
+    bot.ashfinder.config.placeBlocks = previousPlace
   }
 }
 
@@ -61,8 +57,7 @@ export function goToBlock(bot: Bot, pos: Vec3, options: NavigateOptions) {
 
 export function stopAllMovement(bot: Bot) {
   if (!bot.entity) return // not spawned (or already disconnected)
-  bot.pathfinder.stop()
-  bot.pathfinder.setGoal(null)
+  bot.ashfinder.stop()
   bot.clearControlStates()
   bot.stopDigging()
 }

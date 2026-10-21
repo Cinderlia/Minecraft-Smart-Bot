@@ -1,7 +1,7 @@
 import { Bot } from 'mineflayer'
 import { Block } from 'prismarine-block'
 import { Recipe } from 'prismarine-recipe'
-import { goals } from 'mineflayer-pathfinder'
+import { goals } from './goals.js'
 import { TaskCancelledError, throwIfAborted } from '../util/async.js'
 import { countItemId, snapshotInventory } from './inventory.js'
 import { navigate } from './navigation.js'

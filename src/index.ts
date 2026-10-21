@@ -1,6 +1,8 @@
+import { loader as pathfinderLoader } from '@miner-org/mineflayer-baritone'
 import { Agent } from './agent/agent.js'
 import { LlmClient } from './agent/llm.js'
 import { enableAutoEat } from './bot/behaviors.js'
+import { configureMovements } from './bot/navigation.js'
 import { createBot } from './bot/createBot.js'
 import { tryHandleCommand } from './chat/commands.js'
 import { listenForOwnerMessages } from './chat/listener.js'
@@ -13,12 +15,20 @@ const log = createLogger('main')
 function main() {
   const config = loadConfig()
   const bot = createBot(config)
+
+  // Install the pathfinder plugin before any navigation can happen.
+  bot.loadPlugin(pathfinderLoader)
+
   const registry = createToolRegistry()
   const agent = new Agent(bot, registry, new LlmClient(config.llm), config.agent)
 
   log.info(`Loaded ${registry.list().length} tools; model ${config.llm.model}`)
 
-  bot.once('spawn', () => {
+  bot.once('spawn', async () => {
+    // Baritone needs chunk data before it can pathfind reliably.
+    await bot.waitForChunksToLoad()
+
+    configureMovements(bot)
     if (config.agent.autoEat) enableAutoEat(bot, () => agent.busy)
 
     listenForOwnerMessages(bot, config.owners, ({ source, username, message }) => {

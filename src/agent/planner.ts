@@ -21,15 +21,15 @@ export type Plan = {
 
 const PLANNER_SYSTEM = `You are a task planner for a Minecraft bot. Given a player request, the current world state, the available tools, and the available guide sections, produce an ordered task graph.
 
+Goal: a task list that is COARSE enough to be efficient and SPECIFIC enough to be verifiable. Aim for 2-5 tasks for a normal request.
+
 Rules:
 - Do NOT call tools other than submit_plan.
-- Each task must be concrete, actionable and independently checkable.
-- done_when must be verifiable from a tool result (e.g. "check_inventory shows cherry_planks >= 90", "find_block_cells cherry_planks returns >= 70 cells in 301..305,-60..-57,116..120").
-- Keep tasks small (one goal each). Split building into: locate site, gather materials, build shell, add door, verify.
-- depends_on lists the ids of tasks that MUST finish before this one starts. Use [] when the task has no prerequisites (e.g. independent verification, announcing the plan, gathering materials that don't need the site).
-- Tasks with no mutual dependency may run concurrently. Do not invent dependencies you don't need.
-- Communication tasks (announce material, report progress) are allowed and should have depends_on [] unless they reference a specific result.
-- guide_sections must be chosen from the available list.
+- Each task must be a real world-changing action, or a verification of one. Never plan a "say X" task — announcements and reports are handled separately.
+- Merge steps that share a target and need no fresh look at the world between them. Keep separate steps that need a fresh look (a result changes what the next step can do).
+- Prefer letting tools choose details (e.g. place_block picks the exact cell). Do not add a task just to inspect where to act.
+- depends_on lists the ids of tasks that MUST finish first. Use [] when there are no prerequisites.
+- done_when must be verifiable from a tool result.
 - needs lists item ids with approximate counts.
 - Call submit_plan exactly once.`
 

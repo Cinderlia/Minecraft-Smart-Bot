@@ -31,7 +31,8 @@ Rules:
 - depends_on lists the ids of tasks that MUST finish first. Use [] when there are no prerequisites.
 - done_when must be verifiable from a tool result.
 - needs lists item ids with approximate counts.
-- Call submit_plan exactly once.`
+- Call submit_plan exactly once.
+- Do NOT hardcode coordinates in task descriptions unless the player gave them explicitly.`
 
 export async function planTask(
   bot: Bot,

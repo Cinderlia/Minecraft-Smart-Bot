@@ -53,14 +53,10 @@ export class BodyLoop {
     private readonly speaker?: ChatSpeaker,
     private readonly intentSink?: IntentSink
   ) {
-    this.queue.push({
-      id: AUTONOMIC_TASK_ID,
-      rawRequest: 'autonomic',
-      username: 'self',
-      priority: AUTONOMIC_PRIORITY,
-      progress: 0,
-      state: 'queued'
-    })
+    this.ensureAutonomic()
+    // Start the loop immediately so the autonomic task runs from boot, before
+    // any player task arrives. queueMicrotask defers it past the constructor.
+    queueMicrotask(() => { void this.pump() })
   }
 
   snapshot(): BodySnapshot {
@@ -137,7 +133,23 @@ export class BodyLoop {
     this.queue = this.queue.filter(t => t.id === AUTONOMIC_TASK_ID)
     this.current?.controller?.abort()
     this.current = null
+    this.ensureAutonomic()
     stopAllMovement(this.bot)
+  }
+
+  /** Guarantee the autonomic task exists at the tail of the queue. */
+  private ensureAutonomic() {
+    if (this.queue.some(t => t.id === AUTONOMIC_TASK_ID)) return
+    this.queue.push({
+      id: AUTONOMIC_TASK_ID,
+      rawRequest: 'autonomic',
+      username: 'self',
+      priority: AUTONOMIC_PRIORITY,
+      progress: 0,
+      state: 'queued'
+    })
+    this.sortQueue()
+    log.info('[autonomic] reinstated at the tail')
   }
 
   private sortQueue() {
@@ -152,7 +164,8 @@ export class BodyLoop {
     if (this.running) return
     this.running = true
     try {
-      while (this.queue.length > 0) {
+      while (true) {
+        this.ensureAutonomic() // fallback: never let the queue empty out
         this.preempt = false
         const head = this.queue[0]
         this.current = head
@@ -162,7 +175,7 @@ export class BodyLoop {
           const now = Date.now()
           if (now - this.lastAutonomicLog > AUTONOMIC_LOG_INTERVAL_MS) {
             this.lastAutonomicLog = now
-            log.info(`[autonomic] idle — no tasks queued, running self-maintenance tick`)
+            log.info('[autonomic] idle — no tasks queued, running self-maintenance tick')
           }
           await new Promise(r => setTimeout(r, 500))
           continue
@@ -193,6 +206,7 @@ export class BodyLoop {
             head.state = 'queued'
             this.sortQueue()
           }
+          this.ensureAutonomic()
         }
       }
     } finally {
@@ -207,15 +221,6 @@ export class BodyLoop {
       for (const s of task.plan.tasks) {
         log.info(`  [task ${task.id} step ${s.id}] deps=[${s.depends_on.join(',')}] ${s.description}`)
       }
-    }
-
-    // Tell the language loop the task started so the player hears about it.
-    if (this.intentSink) {
-      this.intentSink({
-        taskId: task.id,
-        reason: 'task started',
-        intent: `Just started handling: "${task.rawRequest}". Plan: ${task.plan.goal}. Tell the player in one short line.`
-      })
     }
 
     const plan = task.plan
@@ -268,12 +273,16 @@ export class BodyLoop {
     const summary = plan.tasks.map(s => `[${s.id}] ${results.get(s.id) ?? 'skipped'}`).join(' | ').slice(0, 240)
     log.info(`[task ${task.id}] summary: ${summary}`)
 
-    // Task finished: ask the language loop to report the outcome.
+    // Task finished: hand a short PURPOSE to the language loop. It writes the
+    // actual line from the recent chat, so we never repeat the summary verbatim.
     if (this.intentSink) {
+      const anyBad = [...results.values()].some(r => r.startsWith('failed') || r.startsWith('partial') || r.startsWith('needs_revision'))
       this.intentSink({
         taskId: task.id,
         reason: 'task finished',
-        intent: `Just finished: "${task.rawRequest}". Outcome: ${summary}. Tell the player in one short line.`
+        intent: anyBad
+          ? `The task hit problems: ${summary}. Let the player know briefly.`
+          : 'Task finished'
       })
     }
   }
@@ -285,8 +294,7 @@ export class BodyLoop {
     const userMessage = { role: 'user' as const, content: buildUserMessage(parent.username, stepText, describeWorldState(this.bot, searchTarget)) }
     const messages = [{ role: 'system' as const, content: executePrompt }, userMessage]
 
-    // In task mode the bot cannot `say` directly; it must request a chat via the
-    // language loop so the persona and recent context stay consistent.
+    // Task mode cannot use `say`; it must request a chat via the language loop.
     const tools = this.registry.toOllamaTools().filter(t => t.function.name !== 'say')
     tools.push({
       type: 'function',
@@ -298,7 +306,7 @@ export class BodyLoop {
           type: 'object',
           required: ['reason', 'intent'],
           properties: {
-            reason: { type: 'string', description: 'Why you need to speak (e.g. "task started", "task finished", "got stuck")' },
+            reason: { type: 'string', description: 'Why you need to speak (e.g. "got stuck", "found an obstacle")' },
             intent: { type: 'string', description: 'What to convey, in a short summary' }
           }
         }

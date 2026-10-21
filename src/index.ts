@@ -35,7 +35,7 @@ function main() {
   }
 
   const body = new BodyLoop(bot, registry, bodyLlm, config.agent, speaker, intentSink)
-  language = new LanguageLoop(bot, languageLlm, body, speaker, history)
+  language = new LanguageLoop(bot, languageLlm, body, history)
 
   log.info(`Loaded ${registry.list().length} tools; model ${config.llm.model}`)
 

@@ -73,37 +73,58 @@ export class Agent {
     }
   }
 
-  private async run(request: AgentRequest, signal: AbortSignal) {
-    log.info(`${request.username}: ${request.message}`)
+private async run(request: AgentRequest, signal: AbortSignal) {
+  log.info(`${request.username}: ${request.message}`)
 
-    let plan: Plan
-    try {
-      plan = await planTask(this.bot, this.llm, this.registry, request)
-    } catch (error) {
-      if (signal.aborted) throw new TaskCancelledError()
-      log.error('Planner failed', error)
-      this.bot.chat(`Could not plan that: ${errorMessage(error).slice(0, 120)}`)
-      this.remember(request, '')
-      return
+  let plan: Plan
+  try {
+    plan = await planTask(this.bot, this.llm, this.registry, request)
+  } catch (error) {
+    if (signal.aborted) throw new TaskCancelledError()
+    log.error('Planner failed', error)
+    this.bot.chat(`Could not plan that: ${errorMessage(error).slice(0, 120)}`)
+    this.remember(request, '')
+    return
+  }
+
+  log.info(`Plan: ${plan.goal} — ${plan.tasks.length} task(s)`)
+  for (const t of plan.tasks) {
+    log.info(`  [${t.id}] deps=[${t.depends_on.join(',')}] ${t.description} | done_when: ${t.done_when} | needs: ${t.needs.join(', ') || '-'}`)
+  }
+
+  const results = new Map<number, string>()
+  const remaining = new Map(plan.tasks.map(t => [t.id, t]))
+
+  while (remaining.size > 0) {
+    if (signal.aborted) throw new TaskCancelledError()
+
+    // Ready = tasks whose dependencies are all completed.
+    const ready = [...remaining.values()].filter(t => t.depends_on.every(dep => results.has(dep)))
+    if (ready.length === 0) {
+      // Cycle or missing dependency — bail out.
+      log.error(`Plan has unresolved dependencies: ${[...remaining.keys()].join(',')}`)
+      break
     }
 
-    log.info(`Plan: ${plan.goal} — ${plan.tasks.length} task(s)`)
-    for (const t of plan.tasks) {
-      log.info(`  [${t.id}] ${t.description} | done_when: ${t.done_when} | needs: ${t.needs.join(', ') || '-'}`)
-    }
-
-    const results: string[] = []
-    for (const task of plan.tasks) {
+    // Execute all ready tasks sequentially (the bot can only act on one thing at a time),
+    // in plan order so intent stays readable.
+    ready.sort((a, b) => a.id - b.id)
+    for (const task of ready) {
       if (signal.aborted) throw new TaskCancelledError()
       log.info(`--- Task ${task.id}: ${task.description}`)
       const outcome = await this.runTask(task, request, signal)
-      results.push(`[${task.id}] ${outcome}`)
+      results.set(task.id, outcome)
+      remaining.delete(task.id)
     }
-
-    const summary = results.length > 0 ? results.join(' | ').slice(0, 240) : 'Done.'
-    this.bot.chat(summary)
-    this.remember(request, summary)
   }
+
+  const summary = plan.tasks
+    .map(t => `[${t.id}] ${results.get(t.id) ?? 'skipped'}`)
+    .join(' | ')
+    .slice(0, 240)
+  this.bot.chat(summary || 'Done.')
+  this.remember(request, summary)
+}
 
   /** Execute a single planned task with the standard tool loop. */
   private async runTask(task: PlannedTask, request: AgentRequest, signal: AbortSignal): Promise<string> {

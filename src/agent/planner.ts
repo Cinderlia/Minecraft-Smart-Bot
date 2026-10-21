@@ -6,6 +6,7 @@ import { Bot } from 'mineflayer'
 
 export type PlannedTask = {
   id: number
+  depends_on: number[]
   description: string
   done_when: string
   guide_sections: string[]
@@ -18,16 +19,18 @@ export type Plan = {
   tasks: PlannedTask[]
 }
 
-const PLANNER_SYSTEM = `You are a task planner for a Minecraft bot. Given a player request, the current world state, the available tools, and the available guide sections, produce an ordered task list.
+const PLANNER_SYSTEM = `You are a task planner for a Minecraft bot. Given a player request, the current world state, the available tools, and the available guide sections, produce an ordered task graph.
 
 Rules:
 - Do NOT call tools other than submit_plan.
 - Each task must be concrete, actionable and independently checkable.
 - done_when must be verifiable from a tool result (e.g. "check_inventory shows cherry_planks >= 90", "find_block_cells cherry_planks returns >= 70 cells in 301..305,-60..-57,116..120").
 - Keep tasks small (one goal each). Split building into: locate site, gather materials, build shell, add door, verify.
+- depends_on lists the ids of tasks that MUST finish before this one starts. Use [] when the task has no prerequisites (e.g. independent verification, announcing the plan, gathering materials that don't need the site).
+- Tasks with no mutual dependency may run concurrently. Do not invent dependencies you don't need.
+- Communication tasks (announce material, report progress) are allowed and should have depends_on [] unless they reference a specific result.
 - guide_sections must be chosen from the available list.
 - needs lists item ids with approximate counts.
-- If the request is ambiguous, still produce a plan but add a task "ask the player to clarify X" at the end.
 - Call submit_plan exactly once.`
 
 export async function planTask(
@@ -40,7 +43,7 @@ export async function planTask(
     type: 'function' as const,
     function: {
       name: 'submit_plan',
-      description: 'Submit the final task plan.',
+      description: 'Submit the final task graph.',
       parameters: {
         type: 'object',
         required: ['goal', 'needs', 'tasks'],
@@ -51,9 +54,14 @@ export async function planTask(
             type: 'array',
             items: {
               type: 'object',
-              required: ['id', 'description', 'done_when', 'guide_sections', 'needs'],
+              required: ['id', 'depends_on', 'description', 'done_when', 'guide_sections', 'needs'],
               properties: {
                 id: { type: 'integer' },
+                depends_on: {
+                  type: 'array',
+                  items: { type: 'integer' },
+                  description: 'Ids of tasks that must finish before this one starts'
+                },
                 description: { type: 'string' },
                 done_when: { type: 'string' },
                 guide_sections: { type: 'array', items: { type: 'string' } },

@@ -13,6 +13,7 @@ Rules:
 - Never use markdown, bullet points or headers.
 - If you are busy with a task, say so briefly in natural language (e.g. "on it, give me a sec").
 - Match the player's language (Chinese in → Chinese out).
+- When reporting a finished task, summarize the OUTCOME in natural language ("搞定，镐子丢你脚下了"), not the steps ("[1] done | [2] done").
 - Do not invent facts about the world; if you don't know, say so casually.`
 
 export type ChatContext = {
@@ -31,11 +32,17 @@ export class ChatSpeaker {
 
   /** Fire-and-forget: never awaits the LLM in the caller's task loop. */
   speak(userMessage: string, ctx: ChatContext): void {
+    log.info(`← ${userMessage} | busy: ${ctx.busyWith ?? 'idle'}${ctx.report ? ` | report: ${ctx.report.slice(0, 80)}` : ''}`)
     void this.generate(userMessage, ctx)
       .then(line => {
-        if (line) this.bot.chat(line.slice(0, 200))
+        if (line) {
+          log.info(`→ ${line}`)
+          this.bot.chat(line.slice(0, 200))
+        } else {
+          log.warn('Chat generation returned empty; nothing sent')
+        }
       })
-      .catch(error => log.debug('Chat generation failed', error))
+      .catch(error => log.error('Chat generation failed', error))
   }
 
   private async generate(userMessage: string, ctx: ChatContext): Promise<string> {

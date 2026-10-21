@@ -51,8 +51,7 @@ export class Agent {
   submit(request: AgentRequest) {
     this.queue.push(request)
     if (this.busy) {
-      // Never announce queue status in chat from here; the caller routes it through ChatSpeaker.
-      log.info(`Queued (${this.queue.length} waiting): ${request.message}`)
+      log.info(`[queue] +${request.message} (waiting=${this.queue.length})`)
       return
     }
     void this.drain()
@@ -71,6 +70,7 @@ export class Agent {
   private async drain() {
     while (this.queue.length > 0) {
       const request = this.queue.shift()!
+      log.info(`[drain] starting: ${request.message} (remaining queue=${this.queue.length})`)
       this.controller = new AbortController()
       try {
         await this.run(request, this.controller.signal)
@@ -79,11 +79,11 @@ export class Agent {
           log.info('Task cancelled')
         } else {
           log.error('Agent error', error)
-          // Report failures through the speaker when available, never raw logs.
-          if (this.speaker) this.speaker.speak(request.message, { busyWith: null, report: `Something went wrong: ${errorMessage(error).slice(0, 120)}` })
-          else this.bot.chat(`Something went wrong: ${errorMessage(error).slice(0, 120)}`)
+          if (this.speaker) this.speaker.speak(request.message, { busyWith: null, report: `出了点问题：${errorMessage(error).slice(0, 120)}` })
+          else this.bot.chat(`出了点问题：${errorMessage(error).slice(0, 120)}`)
         }
       } finally {
+        log.info(`[drain] finished: ${request.message}`)
         this.controller = null
         this.currentTaskText = null
       }
@@ -91,7 +91,7 @@ export class Agent {
   }
 
   private async run(request: AgentRequest, signal: AbortSignal) {
-    log.info(`${request.username}: ${request.message}`)
+    log.info(`[request] ${request.username}: ${request.message}`)
 
     let plan: Plan
     try {
@@ -99,15 +99,17 @@ export class Agent {
     } catch (error) {
       if (signal.aborted) throw new TaskCancelledError()
       log.error('Planner failed', error)
-      if (this.speaker) this.speaker.speak(request.message, { busyWith: null, report: `Could not plan that: ${errorMessage(error).slice(0, 120)}` })
-      else this.bot.chat(`Could not plan that: ${errorMessage(error).slice(0, 120)}`)
+      if (this.speaker) this.speaker.speak(request.message, { busyWith: null, report: `我没法规划这个任务：${errorMessage(error).slice(0, 120)}` })
+      else this.bot.chat(`我没法规划这个任务：${errorMessage(error).slice(0, 120)}`)
       this.remember(request, '')
       return
     }
 
-    log.info(`Plan: ${plan.goal} — ${plan.tasks.length} task(s)`)
+    log.info(`[plan] ${plan.goal} — ${plan.tasks.length} task(s)`)
     for (const t of plan.tasks) {
-      log.info(`  [${t.id}] deps=[${t.depends_on.join(',')}] ${t.description} | done_when: ${t.done_when} | needs: ${t.needs.join(', ') || '-'}`)
+      log.info(`  [${t.id}] deps=[${t.depends_on.join(',')}] ${t.description}`)
+      log.info(`       done_when: ${t.done_when}`)
+      log.info(`       needs: ${t.needs.join(', ') || 'none'} | guide: ${t.guide_sections.join(', ') || 'none'}`)
     }
 
     const results = new Map<number, string>()
@@ -122,13 +124,13 @@ export class Agent {
         break
       }
 
-      // The bot acts on one thing at a time, so run ready tasks sequentially in plan order.
       ready.sort((a, b) => a.id - b.id)
       for (const task of ready) {
         if (signal.aborted) throw new TaskCancelledError()
         log.info(`--- Task ${task.id}: ${task.description}`)
         this.currentTaskText = task.description
         const outcome = await this.runTask(task, request, signal)
+        log.info(`--- Task ${task.id} result: ${outcome.slice(0, 160)}`)
         results.set(task.id, outcome)
         remaining.delete(task.id)
       }
@@ -139,13 +141,12 @@ export class Agent {
       .join(' | ')
       .slice(0, 240)
 
-    // Plans and step lists stay in the log; the human-facing summary goes through the speaker.
-    log.info(`Plan summary: ${summary}`)
+    log.info(`[plan summary] ${summary}`)
     if (this.speaker) {
       const ok = [...results.values()].filter(r => !r.startsWith('failed') && !r.startsWith('partial') && !r.startsWith('needs_revision')).length
       this.speaker.speak(request.message, {
         busyWith: null,
-        report: plan.tasks.length <= 1 ? summary : `${ok}/${plan.tasks.length} steps finished. ${summary}`
+        report: plan.tasks.length <= 1 ? summary : `${ok}/${plan.tasks.length} 步完成。${summary}`
       })
     } else {
       this.bot.chat(summary || 'Done.')
@@ -191,6 +192,7 @@ export class Agent {
         describeWorldState(this.bot, searchTarget)
       )
 
+      log.debug(`Task ${task.id} step ${step}: asking LLM (messages=${messages.length})`)
       const response = await this.llm.chat(messages, tools)
       if (signal.aborted) throw new TaskCancelledError()
       messages.push(response)
@@ -198,6 +200,7 @@ export class Agent {
       const calls = response.tool_calls ?? []
       if (calls.length === 0) {
         reply = response.content.trim()
+        log.info(`Task ${task.id} final reply: ${reply.slice(0, 160)}`)
         break
       }
 
@@ -217,12 +220,12 @@ export class Agent {
           searchTarget = args.block.trim()
         }
 
-        log.info(`→ ${name} ${JSON.stringify(call.function.arguments)}`)
+        log.info(`[task ${task.id} step ${step}] → ${name} ${JSON.stringify(call.function.arguments)}`)
         const started = Date.now()
         const outcome = await this.registry.execute({ name, arguments: call.function.arguments }, ctx)
         const took = ((Date.now() - started) / 1000).toFixed(1)
         const output = outcome.output.length > maxToolOutput ? `${outcome.output.slice(0, maxToolOutput)}… (truncated)` : outcome.output
-        log.info(`${outcome.ok ? '✓' : '✗'} ${name} (${took}s): ${output.split('\n')[0]}`)
+        log.info(`[task ${task.id} step ${step}] ${outcome.ok ? '✓' : '✗'} ${name} (${took}s): ${output.split('\n')[0]}`)
 
         toolLog.push(`${outcome.ok ? '✓' : '✗'} ${name} ${JSON.stringify(call.function.arguments)}: ${output.split('\n')[0]}`)
         messages.push({ role: 'tool', tool_name: name, content: output })
@@ -236,6 +239,7 @@ export class Agent {
 
     if (signal.aborted) throw new TaskCancelledError()
 
+    log.info(`Task ${task.id} verifying...`)
     let verdict: Verdict
     try {
       verdict = await verifyTask(this.bot, this.llm, task, request, toolLog)
@@ -245,7 +249,7 @@ export class Agent {
       return reply || 'done (unverified)'
     }
 
-    log.info(`Task ${task.id} verdict: ${verdict.status} — ${verdict.reason}`)
+    log.info(`Task ${task.id} verdict: ${verdict.status} — ${verdict.reason.slice(0, 200)}`)
 
     if (verdict.status === 'done') {
       return verdict.reason || reply || 'done'
@@ -254,7 +258,7 @@ export class Agent {
       if (depth >= maxRevisions) {
         return `partial (gave up after ${maxRevisions} retries): ${verdict.reason}`
       }
-      log.info(`Task ${task.id} partial, retrying with hint: ${verdict.reason}`)
+      log.info(`Task ${task.id} partial, retrying (depth ${depth + 1}/${maxRevisions}): ${verdict.reason.slice(0, 120)}`)
       return this.runTask(
         { ...task, description: `${task.description}\n\nPrevious attempt was partial: ${verdict.reason}\nAddress the missing part before finishing.` },
         request,
@@ -280,7 +284,7 @@ export class Agent {
       needs: verdict.revised_task.needs ?? task.needs,
       guide_sections: verdict.revised_task.guide_sections ?? task.guide_sections
     }
-    log.info(`Task ${task.id} revised (depth ${depth + 1}/${maxRevisions}): ${revised.description}`)
+    log.info(`Task ${task.id} revised (depth ${depth + 1}/${maxRevisions}): ${revised.description.slice(0, 120)}`)
     return this.runTask(revised, request, signal, depth + 1)
   }
 

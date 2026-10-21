@@ -7,8 +7,14 @@ function write(level: Level, scope: string, message: string, extra: unknown[]) {
   if (levels[level] < threshold) return
   const time = new Date().toISOString().slice(11, 19)
   const line = `${time} ${level.toUpperCase().padEnd(5)} [${scope}] ${message}`
-  const out = level === 'error' || level === 'warn' ? console.error : console.log
-  out(line, ...extra)
+  // stderr is line-buffered even when piped, so entries appear immediately.
+  process.stderr.write(line + (extra.length > 0 ? ' ' + extra.map(formatExtra).join(' ') : '') + '\n')
+}
+
+function formatExtra(value: unknown): string {
+  if (value instanceof Error) return value.stack ?? value.message
+  if (typeof value === 'string') return value
+  try { return JSON.stringify(value) } catch { return String(value) }
 }
 
 export type Logger = ReturnType<typeof createLogger>

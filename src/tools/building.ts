@@ -1,6 +1,6 @@
 import { Vec3 } from 'vec3'
 import { countItem } from '../bot/inventory.js'
-import { placeBlockAt, placeBlockNearby } from '../bot/placement.js'
+import { findPlacementCandidates, placeBlockAt } from '../bot/placement.js'
 import { formatPos, resolveItem } from '../bot/world.js'
 import { TaskCancelledError, errorMessage, throwIfAborted } from '../util/async.js'
 import { ToolInputError } from './args.js'
@@ -8,80 +8,65 @@ import { defineTool, positionParams, readOptionalPosition } from './types.js'
 
 const category = 'Building'
 const maxFillVolume = 512
-/** Radius around the bot to search for placeable spots when reporting suggestions. */
-const SUGGEST_RADIUS = 4
-/** Max suggestions to include in a tool result. */
-const SUGGEST_LIMIT = 12
-
-type Spot = { x: number; y: number; z: number }
-
-/**
- * Find absolute coordinates around the bot where a new block could be placed:
- * empty cell, at least one solid neighbour (required by placeBlockAt).
- * Excludes the bot's own body cells.
- */
-function findPlaceableSpots(bot: import('mineflayer').Bot, radius = SUGGEST_RADIUS, limit = SUGGEST_LIMIT): Spot[] {
-  const p = bot.entity?.position
-  if (!p) return []
-  const bx = Math.floor(p.x), by = Math.floor(p.y), bz = Math.floor(p.z)
-  const out: Spot[] = []
-  for (let dy = -2; dy <= 3 && out.length < limit; dy++) {
-    for (let dx = -radius; dx <= radius && out.length < limit; dx++) {
-      for (let dz = -radius; dz <= radius && out.length < limit; dz++) {
-        const x = bx + dx, y = by + dy, z = bz + dz
-        if (dx === 0 && dz === 0 && (dy === 0 || dy === 1)) continue
-        const here = bot.blockAt(new Vec3(x, y, z))
-        if (!here || here.boundingBox !== 'empty') continue
-        const neighbours = [
-          bot.blockAt(new Vec3(x + 1, y, z)),
-          bot.blockAt(new Vec3(x - 1, y, z)),
-          bot.blockAt(new Vec3(x, y + 1, z)),
-          bot.blockAt(new Vec3(x, y - 1, z)),
-          bot.blockAt(new Vec3(x, y, z + 1)),
-          bot.blockAt(new Vec3(x, y, z - 1))
-        ]
-        if (!neighbours.some(n => n && n.boundingBox === 'block')) continue
-        out.push({ x, y, z })
-      }
-    }
-  }
-  return out
-}
-
-function formatSpots(spots: Spot[]): string {
-  return spots.map(s => `(${s.x}, ${s.y}, ${s.z})`).join(', ')
-}
+/** Radius to search for placeable cells around a requested origin. */
+const PLACE_RADIUS = 4
+const PLACE_RADIUS_EXTENDED = 6
+/** Max candidates to actually try before giving up at a given radius. */
+const MAX_CANDIDATES = 3
 
 export const buildingTools = [
   defineTool({
     name: 'place_block',
     category,
     description:
-      'Place a SINGLE block from the inventory at absolute world coordinates (needs a solid neighbouring block), or right next to the bot if coordinates are omitted. ' +
-      'ALWAYS compute the target coordinate from the Terrain section of Current state: Terrain lists solid blocks as absolute-coordinate boxes and their air holes. ' +
-      'A coordinate is placeable only if Terrain (or a later tool result) shows it as air and it has a solid neighbour. Do NOT guess or try coordinates one by one. ' +
-      'For 2+ blocks of the same type, or walls/floors/shelters, use fill_region instead. ' +
-      'If a placement fails, the result lists nearby placeable spots — pick one of those coordinates instead of digging or retrying the same spot.',
+      'Place a SINGLE block from the inventory near a target position. ' +
+      'Pass absolute world coordinates to place near that spot, or omit them to place next to the bot. ' +
+      'The bot picks a valid empty cell (air or water) that has a solid neighbour within 4 blocks of the target, extending to 6 if needed, so you do not need to guess exact coordinates. ' +
+      'If you read Terrain, use it to choose the target area, not a specific cell. ' +
+      'For 2+ blocks of the same type, or walls/floors/shelters, use fill_region instead.',
     params: {
       item: { type: 'string', description: 'Block item to place, e.g. "cobblestone", "torch", "crafting_table"', required: true },
-      ...positionParams('absolute world coordinates (omit for next to the bot)', false)
+      ...positionParams('target area centre (absolute). Omit to place next to the bot.', false)
     },
     async handler(args, { bot, signal }) {
       const name = resolveItem(bot, args.string('item')).name
-      const pos = readOptionalPosition(args)
-      try {
-        const placed = pos ? await placeBlockAt(bot, name, pos, signal) : await placeBlockNearby(bot, name, signal)
-        const spots = findPlaceableSpots(bot)
-        const hint = spots.length > 0 ? ` Nearby placeable spots: ${formatSpots(spots)}.` : ''
-        return `Placed ${placed.name} at ${formatPos(placed.position)}.${hint}`
-      } catch (error) {
-        if (error instanceof TaskCancelledError) throw error
-        const spots = findPlaceableSpots(bot)
-        const hint = spots.length > 0
-          ? ` Nearby placeable spots (empty cell with a solid neighbour): ${formatSpots(spots)}. Pick one of these coordinates from Terrain instead of digging.`
-          : ' No nearby placeable spots found; move to open ground first.'
-        throw new ToolInputError(`${errorMessage(error)}.${hint}`)
+      if (countItem(bot, name) === 0) throw new ToolInputError(`No ${name} in inventory`)
+
+      const requested = readOptionalPosition(args)
+      const origin = requested ?? bot.entity.position.floored()
+
+      // Try radius 4, then 6. The algorithm picks candidate cells, not the LLM.
+      for (const radius of [PLACE_RADIUS, PLACE_RADIUS_EXTENDED]) {
+        const candidates = findPlacementCandidates(bot, origin, radius)
+        if (candidates.length === 0) continue
+
+        const errors: string[] = []
+        const tried = candidates.slice(0, MAX_CANDIDATES)
+        for (const pos of tried) {
+          throwIfAborted(signal)
+          try {
+            const placed = await placeBlockAt(bot, name, pos, signal)
+            const hint = requested
+              ? ` (requested near ${formatPos(requested)}, placed at ${formatPos(placed.position)})`
+              : ''
+            return `Placed ${placed.name} at ${formatPos(placed.position)}${hint}.`
+          } catch (error) {
+            if (error instanceof TaskCancelledError) throw error
+            errors.push(`${formatPos(pos)}: ${errorMessage(error)}`)
+          }
+        }
+
+        const triedList = tried.map(p => formatPos(p)).join(', ')
+        throw new ToolInputError(
+          `Could not place ${name} within ${radius} of ${formatPos(origin)}. Tried ${triedList}; errors: ${errors.join(' | ')}. ` +
+          'Move to an open area or pick a different target area.'
+        )
       }
+
+      throw new ToolInputError(
+        `No empty cell with a solid neighbour within ${PLACE_RADIUS_EXTENDED} blocks of ${formatPos(origin)} for ${name}. ` +
+        'Move to open ground first, or revise the task.'
+      )
     }
   }),
 
@@ -155,9 +140,10 @@ export const buildingTools = [
       let extra = ''
       if (occupied > 0) {
         extra += ` ${occupied} target(s) were already occupied.`
-        const spots = findPlaceableSpots(bot)
+        const spots = findPlacementCandidates(bot, bot.entity.position.floored(), 4)
         if (spots.length > 0) {
-          extra += ` Nearby placeable spots: ${formatSpots(spots)}. Re-read Terrain and pick corners that avoid these occupied cells; do not dig.`
+          const listed = spots.slice(0, 12).map(p => `(${p.x}, ${p.y}, ${p.z})`).join(', ')
+          extra += ` Nearby placeable spots: ${listed}. Re-read Terrain and pick corners that avoid these occupied cells; do not dig.`
         } else {
           extra += ' No nearby placeable spots; move to open ground first.'
         }

@@ -16,7 +16,7 @@ const historyTurns = 6
 /** Max LLM steps allowed per planned task, before the loop is cut. */
 const maxStepsPerTask = 15
 /** Max times a single task may be retried after a needs_revision verdict. */
-const maxRevisions = 1
+const maxRevisions = 2
 
 /** Tools whose `block` argument sets the active search target for surroundings. */
 const SEARCH_TOOLS = new Set(['find_blocks', 'collect_block', 'go_to_block', 'find_block_cells'])
@@ -107,8 +107,7 @@ export class Agent {
         break
       }
 
-      // The bot can only act on one thing at a time, so run ready tasks sequentially
-      // in plan order. depends_on still gates which tasks are eligible this round.
+      // The bot acts on one thing at a time, so run ready tasks sequentially in plan order.
       ready.sort((a, b) => a.id - b.id)
       for (const task of ready) {
         if (signal.aborted) throw new TaskCancelledError()
@@ -127,7 +126,7 @@ export class Agent {
     this.remember(request, summary)
   }
 
-  /** Execute a single planned task with the standard tool loop, then verify it. */
+  /** Execute a single planned task with the tool loop, then verify and possibly revise. */
   private async runTask(
     task: PlannedTask,
     request: AgentRequest,
@@ -212,7 +211,7 @@ export class Agent {
 
     let verdict: Verdict
     try {
-      verdict = await verifyTask(this.bot, this.llm, this.registry, task, toolLog)
+      verdict = await verifyTask(this.bot, this.llm, task, request, toolLog)
     } catch (error) {
       if (signal.aborted) throw new TaskCancelledError()
       log.warn(`Verifier failed for task ${task.id}: ${errorMessage(error)}`)
@@ -235,14 +234,17 @@ export class Agent {
       return `needs_revision (no revised task): ${verdict.reason}`
     }
     if (depth >= maxRevisions) {
-      return `needs_revision (gave up after ${maxRevisions} retry): ${verdict.reason}`
+      return `needs_revision (gave up after ${maxRevisions} revisions): ${verdict.reason}`
     }
-    log.info(`Task ${task.id} revised: ${verdict.revised_task.description}`)
+
     const revised: PlannedTask = {
       ...task,
-      description: verdict.revised_task.description,
-      done_when: verdict.revised_task.done_when
+      description: verdict.revised_task.description ?? task.description,
+      done_when: verdict.revised_task.done_when ?? task.done_when,
+      needs: verdict.revised_task.needs ?? task.needs,
+      guide_sections: verdict.revised_task.guide_sections ?? task.guide_sections
     }
+    log.info(`Task ${task.id} revised (depth ${depth + 1}/${maxRevisions}): ${revised.description}`)
     return this.runTask(revised, request, signal, depth + 1)
   }
 

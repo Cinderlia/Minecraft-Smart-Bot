@@ -16,6 +16,18 @@ function vehicleOf(bot: Bot): Entity | null {
   return (bot as Bot & { vehicle?: Entity | null }).vehicle ?? null
 }
 
+/** Reject coordinates that are implausibly far from the bot — usually a dropped minus sign. */
+function assertNearBot(bot: Bot, pos: Vec3, tool: string): void {
+  const b = bot.entity.position
+  const dy = Math.abs(Math.floor(pos.y) - Math.floor(b.y))
+  if (dy > 64) {
+    throw new ToolInputError(
+      `${tool}: target y=${Math.floor(pos.y)} is ${dy} blocks from the bot (y=${Math.floor(b.y)}). ` +
+      'Check the coordinate for a missing minus sign — copy coordinates from the Terrain section exactly.'
+    )
+  }
+}
+
 export const interactionTools = [
   defineTool({
     name: 'activate_block',
@@ -24,6 +36,7 @@ export const interactionTools = [
     params: positionParams('the block'),
     async handler(args, { bot, signal }) {
       const pos = readPosition(args)
+      assertNearBot(bot, pos, 'activate_block')
       const block = bot.blockAt(pos)
       if (!block || block.name === 'air') throw new ToolInputError(`No block at ${formatPos(pos)}`)
       await goToBlock(bot, pos, { signal })
@@ -35,24 +48,43 @@ export const interactionTools = [
   defineTool({
     name: 'use_item_on_block',
     category,
-    description: 'Use an item on a block: till dirt with a hoe, bone meal crops, light with flint_and_steel, pour a water/lava bucket, plant seeds on farmland.',
+    description:
+      'Use an item on a block: till dirt with a hoe, bone meal crops, light with flint_and_steel, pour a water/lava bucket, plant seeds on farmland. ' +
+      'The target must be an absolute coordinate from the Terrain section of Current state; copy it exactly (mind the minus sign on y).',
     params: {
       item: { type: 'string', description: 'Item to use (equipped automatically)', required: true },
-      ...positionParams('the target block')
+      ...positionParams('the target block (absolute coords)')
     },
     async handler(args, { bot, signal }) {
       const name = resolveItem(bot, args.string('item')).name
       const item = findItem(bot, name)
       if (!item) throw new ToolInputError(`No ${name} in inventory`)
       const pos = readPosition(args)
+      assertNearBot(bot, pos, 'use_item_on_block')
       const block = bot.blockAt(pos)
       if (!block) throw new ToolInputError(`Block at ${formatPos(pos)} is not loaded`)
+
+      // Hoeing farmland again does nothing; report that instead of pretending it worked.
+      if (name.endsWith('_hoe') && block.name === 'farmland') {
+        return `Already farmland at ${formatPos(pos)}; nothing to do.`
+      }
+
+      const before = block.name
       await goToBlock(bot, pos, { signal })
       await bot.equip(item, 'hand')
       await bot.lookAt(pos.offset(0.5, 1, 0.5), true)
       await bot.activateBlock(block, new Vec3(0, 1, 0))
-      await sleep(250, signal)
-      return `Used ${name} on ${block.name} at ${formatPos(pos)}; it is now ${bot.blockAt(pos)?.name}`
+      await sleep(400, signal)
+      const after = bot.blockAt(pos)?.name ?? 'unknown'
+      if (after === before && name.endsWith('_hoe') && before !== 'farmland') {
+        // The update may simply be late; give it one more moment.
+        await sleep(400, signal)
+      }
+      const final = bot.blockAt(pos)?.name ?? 'unknown'
+      if (name.endsWith('_hoe') && before === 'dirt' && final !== 'farmland') {
+        return `Hoe used on dirt at ${formatPos(pos)} but the block did not become farmland (it is ${final}). Farmland needs an adjacent water block within 4 blocks; add water first.`
+      }
+      return `Used ${name} on ${before} at ${formatPos(pos)}; it is now ${final}`
     }
   }),
 

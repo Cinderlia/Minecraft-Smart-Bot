@@ -1,7 +1,7 @@
 import { Bot } from 'mineflayer'
 import { Entity } from 'prismarine-entity'
-import { goals } from 'mineflayer-pathfinder'
 import { bestWeapon, describeInventoryChange, snapshotInventory } from '../bot/inventory.js'
+import { goals } from '../bot/goals.js'
 import { entityLabel, findEntity, isHostile, nearbyEntities } from '../bot/world.js'
 import { sleep, throwIfAborted } from '../util/async.js'
 import { ToolInputError } from './args.js'
@@ -21,6 +21,8 @@ export type FightResult = 'killed' | 'escaped' | 'unreachable' | 'low_health' | 
  * Chase and hit an entity until it dies, the bot gets too hurt, or it gets dragged
  * more than `leash` blocks from where the fight started (so it doesn't follow a
  * skeleton deep into a cave).
+ *
+ * Baritone has no dynamic follow goal, so we re-issue a short goto each tick.
  */
 export async function fight(bot: Bot, entity: Entity, signal: AbortSignal, timeoutMs: number, leash = 20): Promise<FightResult> {
   const weapon = bestWeapon(bot)
@@ -30,7 +32,8 @@ export async function fight(bot: Bot, entity: Entity, signal: AbortSignal, timeo
   const deadline = Date.now() + timeoutMs
   let lastHit = 0
   let lastProgress = Date.now()
-  bot.pathfinder.setGoal(new goals.GoalFollow(entity, 2), true)
+  let navigating = false
+
   try {
     while (Date.now() < deadline) {
       throwIfAborted(signal)
@@ -39,17 +42,24 @@ export async function fight(bot: Bot, entity: Entity, signal: AbortSignal, timeo
       const distance = bot.entity.position.distanceTo(entity.position)
       if (distance > 32 || entity.position.distanceTo(start) > leash) return 'escaped'
       if (Date.now() - lastProgress > 15_000) return 'unreachable'
+
       // Respect the attack cooldown (~0.6s for swords) so hits do full damage.
       if (distance <= 3.2 && Date.now() - lastHit >= 650) {
         await bot.lookAt(entity.position.offset(0, entity.height * 0.8, 0), true)
         bot.attack(entity)
         lastHit = lastProgress = Date.now()
+      } else if (distance > 3.2 && !navigating) {
+        // Re-issue a short chase goal without blocking the loop.
+        navigating = true
+        void bot.ashfinder.gotoSmart(new goals.GoalNear(entity.position.x, entity.position.y, entity.position.z, 2), { waypointThreshold: 10, forceAdaptive: true })
+          .catch(() => {})
+          .finally(() => { navigating = false })
       }
       await sleep(100, signal)
     }
     return 'timeout'
   } finally {
-    bot.pathfinder.setGoal(null)
+    bot.ashfinder.stop()
   }
 }
 

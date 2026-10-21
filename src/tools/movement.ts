@@ -1,5 +1,5 @@
-import { goals } from 'mineflayer-pathfinder'
 import { Vec3 } from 'vec3'
+import { goals } from '../bot/goals.js'
 import { goToPosition, navigate, stopAllMovement } from '../bot/navigation.js'
 import { findEntity, findNearestBlock, formatPos, resolveBlockFamily } from '../bot/world.js'
 import { sleep } from '../util/async.js'
@@ -7,6 +7,12 @@ import { ToolInputError } from './args.js'
 import { defineTool, positionParams, readPosition } from './types.js'
 
 const category = 'Movement'
+
+/**
+ * Background follow loops, keyed by bot. Baritone has no persistent follow
+ * goal, so we keep re-issuing a short goto until stop() clears it.
+ */
+const followLoops = new WeakMap<object, { stopped: boolean }>()
 
 export const movementTools = [
   defineTool({
@@ -49,7 +55,9 @@ export const movementTools = [
   defineTool({
     name: 'follow',
     category,
-    description: 'Keep following a player or entity in the background until told to stop. Returns immediately.',
+    description:
+      'Keep following a player or entity in the background until told to stop. Returns immediately. ' +
+      'Stop it with the stop tool or by starting another task.',
     params: {
       target: { type: 'string', description: 'Player username or mob name', required: true },
       distance: { type: 'number', description: 'Distance to keep, in blocks (default 3)' }
@@ -58,8 +66,32 @@ export const movementTools = [
       const target = args.string('target')
       const entity = findEntity(bot, target, 128)
       if (!entity) throw new ToolInputError(`Cannot see "${target}"`)
+
+      // Cancel any previous follow loop.
+      const previous = followLoops.get(bot)
+      if (previous) previous.stopped = true
+
       const distance = args.optionalNumber('distance', { min: 1, max: 16 }) ?? 3
-      bot.pathfinder.setGoal(new goals.GoalFollow(entity, distance), true)
+      const state = { stopped: false }
+      followLoops.set(bot, state)
+
+      // Background loop: re-issue a short chase goal every 500ms.
+      void (async () => {
+        while (!state.stopped) {
+          const live = findEntity(bot, target, 128)
+          if (!live) break
+          try {
+            await bot.ashfinder.gotoSmart(
+              new goals.GoalNear(live.position.x, live.position.y, live.position.z, distance),
+              { waypointThreshold: 10, forceAdaptive: true }
+            )
+          } catch {
+            // unreachable this round; retry on the next tick
+          }
+          await sleep(500)
+        }
+      })()
+
       return `Now following ${target}. Call stop to end.`
     }
   }),
@@ -173,6 +205,9 @@ export const movementTools = [
     description: 'Stop all movement, following, digging and attacking.',
     params: {},
     async handler(_args, { bot }) {
+      const state = followLoops.get(bot)
+      if (state) state.stopped = true
+      followLoops.delete(bot)
       stopAllMovement(bot)
       return 'Stopped'
     }

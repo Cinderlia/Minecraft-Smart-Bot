@@ -60,10 +60,24 @@ export function canHarvest(bot: Bot, block: Block): boolean {
   return bot.inventory.items().some(item => block.harvestTools![item.type])
 }
 
-/** Equip the fastest tool for a block (no-op if bare hands are best). */
+const toolTier = ['netherite', 'diamond', 'iron', 'stone', 'golden', 'wooden']
+
+/**
+ * Equip the best tool for a block. Baritone does not expose bestHarvestTool,
+ * so pick from the inventory by harvest capability and material tier.
+ */
 export async function equipBestToolFor(bot: Bot, block: Block): Promise<void> {
-  const tool = bot.pathfinder.bestHarvestTool(block)
-  if (tool && bot.heldItem?.type !== tool.type) await bot.equip(tool, 'hand')
+  const harvest = block.harvestTools
+  if (!harvest) return // any tool/hand works
+  const candidates = bot.inventory.items().filter(i => harvest[i.type])
+  if (candidates.length === 0) return
+  candidates.sort((a, b) => {
+    const ta = toolTier.findIndex(t => a.name.startsWith(t))
+    const tb = toolTier.findIndex(t => b.name.startsWith(t))
+    return (ta === -1 ? 99 : ta) - (tb === -1 ? 99 : tb)
+  })
+  const best = candidates[0]
+  if (bot.heldItem?.type !== best.type) await bot.equip(best, 'hand')
 }
 
 const weaponPriority = [

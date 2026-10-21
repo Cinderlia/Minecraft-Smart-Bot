@@ -1,8 +1,12 @@
 import { Bot } from 'mineflayer'
 import { Vec3 } from 'vec3'
 import { TaskCancelledError, errorMessage, withTimeout } from '../util/async.js'
-import { goals } from './goals.js'
+import { goals, Goal } from './goals.js'
 
+/**
+ * Travel by default never breaks blocks, so the bot walks around builds.
+ * Only tasks that explicitly need to dig through terrain opt in with allowDig: true.
+ */
 export function configureMovements(bot: Bot) {
   bot.ashfinder.config.parkour = true
   bot.ashfinder.config.breakBlocks = false
@@ -15,7 +19,7 @@ export type NavigateOptions = {
   signal: AbortSignal
 }
 
-export async function navigate(bot: Bot, goal: goals.Goal, options: NavigateOptions): Promise<void> {
+export async function navigate(bot: Bot, goal: Goal, options: NavigateOptions): Promise<void> {
   const allowDig = options.allowDig === true
   const previousBreak = bot.ashfinder.config.breakBlocks
   const previousPlace = bot.ashfinder.config.placeBlocks
@@ -47,6 +51,7 @@ export function goToPosition(bot: Bot, pos: Vec3, range: number, options: Naviga
   return navigate(bot, new goals.GoalNear(pos.x, pos.y, pos.z, range), options)
 }
 
+/** Move within reach of a block so it can be dug or interacted with. */
 export function goToBlock(bot: Bot, pos: Vec3, options: NavigateOptions) {
   if (bot.entity.position.distanceTo(pos.offset(0.5, 0.5, 0.5)) <= 4) return Promise.resolve()
   return navigate(bot, new goals.GoalLookAtBlock(pos, bot.world, { reach: 4 }), options)

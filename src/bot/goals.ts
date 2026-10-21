@@ -1,4 +1,4 @@
-import { goals as baritoneGoals } from '@miner-org/mineflayer-baritone'
+import { goals as baritoneGoals, Goal } from '@miner-org/mineflayer-baritone'
 import { Vec3 } from 'vec3'
 
 /**
@@ -46,6 +46,13 @@ class GoalXZ extends baritoneGoals.GoalXZ {
   }
 }
 
+/** Old GoalNearXZ: within `range` of (x,z) at any y. Baritone has GoalXZNear for this. */
+class GoalNearXZ extends baritoneGoals.GoalXZNear {
+  constructor(x: number, z: number, range: number) {
+    super(new Vec3(x, 0, z), range)
+  }
+}
+
 /** Inverts a goal (used to push the bot out of a cell it is standing in). */
 class GoalInvert extends baritoneGoals.GoalInvert {}
 
@@ -55,5 +62,8 @@ export const goals = {
   GoalLookAtBlock,
   GoalFollow,
   GoalXZ,
+  GoalNearXZ,
   GoalInvert
 }
+
+export type { Goal }

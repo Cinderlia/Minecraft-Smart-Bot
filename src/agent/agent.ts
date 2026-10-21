@@ -7,6 +7,7 @@ import { TaskCancelledError, errorMessage } from '../util/async.js'
 import { createLogger } from '../util/logger.js'
 import { LlmClient, Message } from './llm.js'
 import { Plan, PlannedTask, planTask } from './planner.js'
+import { Verdict, verifyTask } from './verifier.js'
 import { buildSystemPrompt, buildUserMessage, renderGuideSections } from './prompt.js'
 
 const log = createLogger('agent')
@@ -14,6 +15,8 @@ const maxToolOutput = 2000
 const historyTurns = 6
 /** Max LLM steps allowed per planned task, before the loop is cut. */
 const maxStepsPerTask = 15
+/** Max times a single task may be retried after a needs_revision verdict. */
+const maxRevisions = 1
 
 /** Tools whose `block` argument sets the active search target for surroundings. */
 const SEARCH_TOOLS = new Set(['find_blocks', 'collect_block', 'go_to_block', 'find_block_cells'])
@@ -73,61 +76,64 @@ export class Agent {
     }
   }
 
-private async run(request: AgentRequest, signal: AbortSignal) {
-  log.info(`${request.username}: ${request.message}`)
+  private async run(request: AgentRequest, signal: AbortSignal) {
+    log.info(`${request.username}: ${request.message}`)
 
-  let plan: Plan
-  try {
-    plan = await planTask(this.bot, this.llm, this.registry, request)
-  } catch (error) {
-    if (signal.aborted) throw new TaskCancelledError()
-    log.error('Planner failed', error)
-    this.bot.chat(`Could not plan that: ${errorMessage(error).slice(0, 120)}`)
-    this.remember(request, '')
-    return
-  }
-
-  log.info(`Plan: ${plan.goal} — ${plan.tasks.length} task(s)`)
-  for (const t of plan.tasks) {
-    log.info(`  [${t.id}] deps=[${t.depends_on.join(',')}] ${t.description} | done_when: ${t.done_when} | needs: ${t.needs.join(', ') || '-'}`)
-  }
-
-  const results = new Map<number, string>()
-  const remaining = new Map(plan.tasks.map(t => [t.id, t]))
-
-  while (remaining.size > 0) {
-    if (signal.aborted) throw new TaskCancelledError()
-
-    // Ready = tasks whose dependencies are all completed.
-    const ready = [...remaining.values()].filter(t => t.depends_on.every(dep => results.has(dep)))
-    if (ready.length === 0) {
-      // Cycle or missing dependency — bail out.
-      log.error(`Plan has unresolved dependencies: ${[...remaining.keys()].join(',')}`)
-      break
-    }
-
-    // Execute all ready tasks sequentially (the bot can only act on one thing at a time),
-    // in plan order so intent stays readable.
-    ready.sort((a, b) => a.id - b.id)
-    for (const task of ready) {
+    let plan: Plan
+    try {
+      plan = await planTask(this.bot, this.llm, this.registry, request)
+    } catch (error) {
       if (signal.aborted) throw new TaskCancelledError()
-      log.info(`--- Task ${task.id}: ${task.description}`)
-      const outcome = await this.runTask(task, request, signal)
-      results.set(task.id, outcome)
-      remaining.delete(task.id)
+      log.error('Planner failed', error)
+      this.bot.chat(`Could not plan that: ${errorMessage(error).slice(0, 120)}`)
+      this.remember(request, '')
+      return
     }
+
+    log.info(`Plan: ${plan.goal} — ${plan.tasks.length} task(s)`)
+    for (const t of plan.tasks) {
+      log.info(`  [${t.id}] deps=[${t.depends_on.join(',')}] ${t.description} | done_when: ${t.done_when} | needs: ${t.needs.join(', ') || '-'}`)
+    }
+
+    const results = new Map<number, string>()
+    const remaining = new Map(plan.tasks.map(t => [t.id, t]))
+
+    while (remaining.size > 0) {
+      if (signal.aborted) throw new TaskCancelledError()
+
+      const ready = [...remaining.values()].filter(t => t.depends_on.every(dep => results.has(dep)))
+      if (ready.length === 0) {
+        log.error(`Plan has unresolved dependencies: ${[...remaining.keys()].join(',')}`)
+        break
+      }
+
+      // The bot can only act on one thing at a time, so run ready tasks sequentially
+      // in plan order. depends_on still gates which tasks are eligible this round.
+      ready.sort((a, b) => a.id - b.id)
+      for (const task of ready) {
+        if (signal.aborted) throw new TaskCancelledError()
+        log.info(`--- Task ${task.id}: ${task.description}`)
+        const outcome = await this.runTask(task, request, signal)
+        results.set(task.id, outcome)
+        remaining.delete(task.id)
+      }
+    }
+
+    const summary = plan.tasks
+      .map(t => `[${t.id}] ${results.get(t.id) ?? 'skipped'}`)
+      .join(' | ')
+      .slice(0, 240)
+    this.bot.chat(summary || 'Done.')
+    this.remember(request, summary)
   }
 
-  const summary = plan.tasks
-    .map(t => `[${t.id}] ${results.get(t.id) ?? 'skipped'}`)
-    .join(' | ')
-    .slice(0, 240)
-  this.bot.chat(summary || 'Done.')
-  this.remember(request, summary)
-}
-
-  /** Execute a single planned task with the standard tool loop. */
-  private async runTask(task: PlannedTask, request: AgentRequest, signal: AbortSignal): Promise<string> {
+  /** Execute a single planned task with the standard tool loop, then verify it. */
+  private async runTask(
+    task: PlannedTask,
+    request: AgentRequest,
+    signal: AbortSignal,
+    depth = 0
+  ): Promise<string> {
     const executePrompt = buildSystemPrompt(
       this.bot.username,
       this.registry,
@@ -148,11 +154,11 @@ private async run(request: AgentRequest, signal: AbortSignal) {
     const tools = this.registry.toOllamaTools()
     const ctx = { bot: this.bot, signal, log, requester: request.username }
 
+    const toolLog: string[] = []
     let reply = ''
     let step = 0
 
     for (; step < maxStepsPerTask; step++) {
-      // Refresh the user message so the model sees current surroundings each turn.
       userMessage.content = buildUserMessage(
         request.username,
         taskText,
@@ -172,7 +178,6 @@ private async run(request: AgentRequest, signal: AbortSignal) {
       for (const call of calls) {
         const name = call.function.name
         if (name === 'select_guide') {
-          // Planner already chose guide sections; ignore stray select_guide calls.
           messages.push({
             role: 'tool',
             tool_name: name,
@@ -192,6 +197,8 @@ private async run(request: AgentRequest, signal: AbortSignal) {
         const took = ((Date.now() - started) / 1000).toFixed(1)
         const output = outcome.output.length > maxToolOutput ? `${outcome.output.slice(0, maxToolOutput)}… (truncated)` : outcome.output
         log.info(`${outcome.ok ? '✓' : '✗'} ${name} (${took}s): ${output.split('\n')[0]}`)
+
+        toolLog.push(`${outcome.ok ? '✓' : '✗'} ${name} ${JSON.stringify(call.function.arguments)}: ${output.split('\n')[0]}`)
         messages.push({ role: 'tool', tool_name: name, content: output })
       }
     }
@@ -200,7 +207,43 @@ private async run(request: AgentRequest, signal: AbortSignal) {
       reply = `stopped after ${maxStepsPerTask} steps`
       log.info(`Task ${task.id} hit maxStepsPerTask without a final reply`)
     }
-    return reply || 'done'
+
+    if (signal.aborted) throw new TaskCancelledError()
+
+    let verdict: Verdict
+    try {
+      verdict = await verifyTask(this.bot, this.llm, this.registry, task, toolLog)
+    } catch (error) {
+      if (signal.aborted) throw new TaskCancelledError()
+      log.warn(`Verifier failed for task ${task.id}: ${errorMessage(error)}`)
+      return reply || 'done (unverified)'
+    }
+
+    log.info(`Task ${task.id} verdict: ${verdict.status} — ${verdict.reason}`)
+
+    if (verdict.status === 'done') {
+      return verdict.reason || reply || 'done'
+    }
+    if (verdict.status === 'partial') {
+      return `partial: ${verdict.reason}`
+    }
+    if (verdict.status === 'failed') {
+      return `failed: ${verdict.reason}`
+    }
+    // needs_revision
+    if (!verdict.revised_task) {
+      return `needs_revision (no revised task): ${verdict.reason}`
+    }
+    if (depth >= maxRevisions) {
+      return `needs_revision (gave up after ${maxRevisions} retry): ${verdict.reason}`
+    }
+    log.info(`Task ${task.id} revised: ${verdict.revised_task.description}`)
+    const revised: PlannedTask = {
+      ...task,
+      description: verdict.revised_task.description,
+      done_when: verdict.revised_task.done_when
+    }
+    return this.runTask(revised, request, signal, depth + 1)
   }
 
   private remember(request: AgentRequest, reply: string) {

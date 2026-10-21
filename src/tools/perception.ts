@@ -49,7 +49,8 @@ export const perceptionTools = [
   defineTool({
     name: 'find_blocks',
     category,
-    description: 'Locate the nearest blocks of a type. Accepts exact names ("iron_ore") or families ("log", "iron", "bed", "water").',
+    description: 'Locate the nearest blocks of a type. Accepts exact names ("iron_ore") or families ("log", "iron", "bed", "water"). ' +
+      'For a full list of every cell of one exact block type in a small radius, use find_block_cells instead.',
     params: {
       block: { type: 'string', description: 'Block name or family', required: true },
       max_distance: { type: 'number', description: 'Search radius (default 64, max 128)' },
@@ -71,9 +72,48 @@ export const perceptionTools = [
   }),
 
   defineTool({
+    name: 'find_block_cells',
+    category,
+    description:
+      'List the exact absolute coordinates of EVERY block of one type within a radius around the bot, nearest first. ' +
+      'Use this to verify what was built, count a patch, or plan clearing a room — one call replaces inspecting cells one by one. ' +
+      'Requires an exact block id (e.g. "dirt", "cherry_planks"); do NOT pass families. ' +
+      'For "go mine some X" use find_blocks or collect_block instead.',
+    params: {
+      block: { type: 'string', description: 'Exact block id (e.g. "cherry_planks", "dirt")', required: true },
+      radius: { type: 'number', description: 'Search radius in blocks (default 6, max 16)' },
+      limit: { type: 'integer', description: 'Max cells to list (default 64, max 256)' }
+    },
+    async handler(args, { bot }) {
+      const name = args.string('block').trim()
+      const radius = args.optionalNumber('radius', { min: 1, max: 16 }) ?? 6
+      const limit = args.int('limit', 64, { min: 1, max: 256 })
+
+      const blockId = bot.registry.blocksByName[name]?.id
+      if (blockId === undefined) {
+        const sample = Object.keys(bot.registry.blocksByName).slice(0, 12).join(', ')
+        throw new ToolInputError(`Unknown block "${name}". Pass an exact block id (e.g. dirt, cherry_planks). Some known ids: ${sample}, ...`)
+      }
+
+      const positions = bot.findBlocks({ matching: blockId, maxDistance: radius, count: limit })
+      if (positions.length === 0) return `No "${name}" within ${radius} blocks.`
+
+      const p = bot.entity.position
+      const listed = positions
+        .map(pos => ({ pos, d: pos.distanceTo(p) }))
+        .sort((a, b) => a.d - b.d)
+        .map(({ pos, d }) => `(${pos.x}, ${pos.y}, ${pos.z}) ${d.toFixed(1)}m`)
+
+      const more = positions.length >= limit ? ` (capped at ${limit}; raise limit or shrink radius for more)` : ''
+      return `${name} within ${radius} blocks — ${listed.length} cell(s), nearest first${more}:\n${listed.join(', ')}`
+    }
+  }),
+
+  defineTool({
     name: 'inspect_block',
     category,
-    description: 'Describe the block at coordinates: name, hardness, which tools can harvest it, and whether the bot can.',
+    description: 'Describe the block at coordinates: name, hardness, which tools can harvest it, and whether the bot can. ' +
+      'For checking many coordinates at once, use find_block_cells instead of calling this repeatedly.',
     params: positionParams('the block'),
     async handler(args, { bot }) {
       const pos = readPosition(args)

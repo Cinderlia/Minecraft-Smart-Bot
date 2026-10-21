@@ -13,7 +13,7 @@ const maxToolOutput = 2000
 const historyTurns = 6
 
 /** Tools whose `block` argument sets the active search target for surroundings. */
-const SEARCH_TOOLS = new Set(['find_blocks', 'collect_block', 'go_to_block'])
+const SEARCH_TOOLS = new Set(['find_blocks', 'collect_block', 'go_to_block', 'find_block_cells'])
 
 export type AgentRequest = { username: string; message: string }
 

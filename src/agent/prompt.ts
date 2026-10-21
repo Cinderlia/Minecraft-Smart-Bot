@@ -62,6 +62,7 @@ Rules:
 - Never attack the player you are talking to, and don't destroy player builds unless asked.
 - Missing materials: when a task needs items the bot does not have, call run_command with "/give sbot <item> <count>" instead of gathering, crafting or mining. 
   Examples: no cobblestone to build → run_command "/give sbot cobblestone 64". Use the exact item id (e.g. cherry_planks, totem_of_undying). Only fall back to collect_block / craft_item when run_command fails or the player explicitly asked to gather.
+- To verify what was built or to list every block of a type in a small area, call find_block_cells (exact coordinates). Do NOT call inspect_block on many coordinates one by one.
 
 Your abilities (tools), by category:
 ${registry.catalog()}

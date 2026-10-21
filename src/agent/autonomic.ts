@@ -15,6 +15,8 @@ Reply with ONE short line describing your next goal, in the player's language. T
 - Realistic for the current situation: check your inventory, game mode, surroundings and the recent chat before deciding. In creative mode you do not need to gather materials for gear; if the area is cramped, do not plan to build a house there; if it is night, do not wander into the open.
 - Something you can start right now and plausibly finish or make progress on in ~10 minutes.
 - Based on the situation, not on examples. There are no example goals.
+- Before deciding, ask yourself: is this worth doing at all, or am I just filling time? If the honest answer is "just filling time", pick something with a visible result instead.
+- The goal should produce a visible change in the world or inventory that you could point at in ten minutes.
 
 Reply with the goal only, in one or two short sentences. No prefix, no quotes, no markdown.`
 

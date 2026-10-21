@@ -5,7 +5,7 @@ import { createLogger } from '../util/logger.js'
 import { TaskCancelledError } from '../util/async.js'
 import { ChatHistory } from '../chat/history.js'
 import { LlmClient, Message } from './llm.js'
-import { Plan, PlannedTask, planTask } from './planner.js'
+import { Plan, PlannedStep, planTask } from './planner.js'
 import { verifyTask } from './verifier.js'
 import { buildSystemPrompt, buildUserMessage, renderGuideSections } from './prompt.js'
 import { describeWorldState } from '../bot/status.js'
@@ -80,8 +80,6 @@ export class BodyLoop {
       controller: undefined
     }
     fake.controller = new AbortController()
-    const inner = fake.controller.signal
-    // Bridge the outer signal into the fake task's controller.
     const onOuterAbort = () => fake.controller?.abort()
     signal.addEventListener('abort', onOuterAbort, { once: true })
     try {
@@ -235,7 +233,7 @@ export class BodyLoop {
         } catch (error) {
           if (error instanceof TaskCancelledError) {
             const s: QueuedTask['state'] = head.state
-            head.state = (s as QueuedTask['state']) === 'suspended' ? 'suspended' : 'cancelled'
+            head.state = (head.state as QueuedTask['state']) === 'suspended' ? 'suspended' : 'cancelled'
           } else {
             log.error(`[task ${head.id}] failed`, error)
             head.state = 'failed'
@@ -266,7 +264,7 @@ export class BodyLoop {
       task.plan = await planTask(this.bot, this.llm, this.registry, { username: task.username, message: task.rawRequest })
       log.info(`[task ${task.id}] plan: ${task.plan.goal} — ${task.plan.tasks.length} step(s)`)
       for (const s of task.plan.tasks) {
-        log.info(`  [task ${task.id} step ${s.id}] deps=[${s.depends_on.join(',')}] ${s.description}`)
+        log.info(`  [task ${task.id} step ${s.id}] deps=[${s.depends_on.join(',')}] consumes=[${(s.consumes ?? []).join(',')}] ${s.description}`)
       }
     }
 
@@ -303,7 +301,11 @@ export class BodyLoop {
 
         const plannedIndex = plan.tasks.findIndex(s => s.id === planned.id)
         log.info(`--- [task ${task.id} step ${planned.id}] ${planned.description}`)
-        const outcome = await this.runPlannedStep(planned, task, signal)
+        const priorOutputs = new Map<number, string>()
+        for (const [id, text] of results) {
+          if (!text.startsWith('(completed earlier)')) priorOutputs.set(id, text)
+        }
+        const outcome = await this.runPlannedStep(planned, task, signal, priorOutputs)
         results.set(planned.id, outcome)
         remaining.delete(planned.id)
         task.progress = Math.max(task.progress, plannedIndex + 1)
@@ -332,10 +334,35 @@ export class BodyLoop {
     }
   }
 
-  private async runPlannedStep(step: PlannedTask, parent: QueuedTask, signal: AbortSignal, depth = 0): Promise<string> {
+  private async runPlannedStep(
+    step: PlannedStep,
+    parent: QueuedTask,
+    signal: AbortSignal,
+    priorOutputs: Map<number, string> = new Map(),
+    depth = 0
+  ): Promise<string> {
     const executePrompt = buildSystemPrompt(this.bot.username, this.registry, renderGuideSections(step.guide_sections))
     let searchTarget: string | null = null
-    const stepText = `${step.description}\n\nDone when: ${step.done_when}${step.needs.length > 0 ? `\nItems needed: ${step.needs.join(', ')}` : ''}`
+
+    // Pull in the outputs of any steps this one consumes (blueprints, coordinate lists, ...).
+    const consumedText = (step.consumes ?? [])
+      .map(id => {
+        const text = priorOutputs.get(id)
+        if (!text) return null
+        return `--- Output of step ${id} (must be followed exactly):\n${text.slice(0, 1500)}`
+      })
+      .filter((x): x is string => !!x)
+      .join('\n\n')
+
+    const outputHint = step.output_format ? `\n\nYour final reply must contain: ${step.output_format}` : ''
+
+    const stepText =
+      `${step.description}\n\n` +
+      `Done when: ${step.done_when}` +
+      (step.needs.length > 0 ? `\nItems needed: ${step.needs.join(', ')}` : '') +
+      (consumedText ? `\n\n${consumedText}` : '') +
+      outputHint
+
     const userMessage: Message = { role: 'user', content: buildUserMessage(parent.username, stepText, describeWorldState(this.bot, searchTarget)) }
     const messages: Message[] = [{ role: 'system', content: executePrompt }, userMessage]
 
@@ -427,7 +454,7 @@ export class BodyLoop {
     if (verdict.status === 'partial') {
       if (depth >= 2) return `partial: ${verdict.reason}`
       log.info(`[task ${parent.id} step ${step.id}] partial, retrying (depth ${depth + 1}/2)`)
-      return this.runPlannedStep({ ...step, description: `${step.description}\n\nPartial: ${verdict.reason}` }, parent, signal, depth + 1)
+      return this.runPlannedStep({ ...step, description: `${step.description}\n\nPartial: ${verdict.reason}` }, parent, signal, priorOutputs, depth + 1)
     }
     if (verdict.status === 'failed') return `failed: ${verdict.reason}`
     if (!verdict.revised_task) return `needs_revision: ${verdict.reason}`
@@ -437,6 +464,7 @@ export class BodyLoop {
       { ...step, description: verdict.revised_task.description ?? step.description, done_when: verdict.revised_task.done_when ?? step.done_when },
       parent,
       signal,
+      priorOutputs,
       depth + 1
     )
   }

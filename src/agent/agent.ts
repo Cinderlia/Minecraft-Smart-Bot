@@ -7,7 +7,7 @@ import { TaskCancelledError, errorMessage } from '../util/async.js'
 import { createLogger } from '../util/logger.js'
 import { ChatSpeaker } from './chat.js'
 import { LlmClient, Message } from './llm.js'
-import { Plan, PlannedTask, planTask } from './planner.js'
+import { Plan, PlannedStep, planTask } from './planner.js'
 import { Verdict, verifyTask } from './verifier.js'
 import { buildSystemPrompt, buildUserMessage, renderGuideSections } from './prompt.js'
 
@@ -156,7 +156,7 @@ export class Agent {
 
   /** Execute a single planned task with the tool loop, then verify and possibly revise. */
   private async runTask(
-    task: PlannedTask,
+    task: PlannedStep,
     request: AgentRequest,
     signal: AbortSignal,
     depth = 0
@@ -277,7 +277,7 @@ export class Agent {
       return `needs_revision (gave up after ${maxRevisions} revisions): ${verdict.reason}`
     }
 
-    const revised: PlannedTask = {
+    const revised: PlannedStep = {
       ...task,
       description: verdict.revised_task.description ?? task.description,
       done_when: verdict.revised_task.done_when ?? task.done_when,

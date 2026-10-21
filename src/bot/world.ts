@@ -160,3 +160,9 @@ export function findPlacementReference(bot: Bot, target: Vec3): { reference: Blo
   }
   return null
 }
+
+export function isOwnerOnline(bot: Bot, owners: string[]): boolean {
+  const players = bot.players ?? {}
+  const online = new Set(Object.keys(players).map(n => n.toLowerCase()))
+  return owners.some(o => online.has(o.toLowerCase()))
+}

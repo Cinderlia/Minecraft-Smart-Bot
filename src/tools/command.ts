@@ -44,24 +44,23 @@ export const commandTools = [
         throw new ToolInputError(`Refusing dangerous command: ${command}`)
       }
 
-      // Capture the server's reply so callers can verify effects (data get, enchant errors, etc.).
+      // Capture only system messages (command results), not player chat or game_info.
       const responses: string[] = []
-      const listener = (msg: unknown) => {
+      const listener = (msg: any, position: string) => {
+        if (position !== 'system') return
         const text = String(msg).trim()
         if (text) responses.push(text)
       }
       bot.on('message', listener)
       try {
         bot.chat(command)
-        await sleep(600)
+        await sleep(700)
       } finally {
         bot.off('message', listener)
       }
 
-      const relevant = responses.filter(r => RELEVANT.test(r))
-      const feedback = relevant.length > 0
-        ? ` Server: ${relevant.join(' | ').slice(0, 400)}`
-        : ''
+      const tail = responses.slice(-8)
+      const feedback = tail.length > 0 ? ` Server: ${tail.join(' | ').slice(0, 500)}` : ''
       return `Sent command: ${command}.${feedback}`
     }
   })

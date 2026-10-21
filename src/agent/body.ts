@@ -3,8 +3,8 @@ import { Config } from '../config.js'
 import { ToolRegistry } from '../tools/registry.js'
 import { createLogger } from '../util/logger.js'
 import { TaskCancelledError } from '../util/async.js'
-import { ChatSpeaker } from './chat.js'
-import { LlmClient } from './llm.js'
+import { ChatHistory } from '../chat/history.js'
+import { LlmClient, Message } from './llm.js'
 import { Plan, PlannedTask, planTask } from './planner.js'
 import { verifyTask } from './verifier.js'
 import { buildSystemPrompt, buildUserMessage, renderGuideSections } from './prompt.js'
@@ -34,9 +34,11 @@ export type BodySnapshot = {
   queued: { id: string; request: string; description: string; priority: number; progress: string }[]
 }
 
+type AutoHandle = { run(signal: AbortSignal): Promise<void>; suspend(): void; stop(): void }
+
 const AUTONOMIC_TASK_ID = '__autonomic__'
 const AUTONOMIC_PRIORITY = Number.MIN_SAFE_INTEGER
-const AUTONOMIC_LOG_INTERVAL_MS = 60_000
+const AUTONOMIC_LOG_INTERVAL_MS = 5 * 60_000
 
 export class BodyLoop {
   private queue: QueuedTask[] = []
@@ -44,19 +46,51 @@ export class BodyLoop {
   private preempt = false
   private running = false
   private lastAutonomicLog = 0
+  private auto?: AutoHandle
 
   constructor(
     private readonly bot: Bot,
     private readonly registry: ToolRegistry,
     private readonly llm: LlmClient,
     private readonly config: Config['agent'],
-    private readonly speaker?: ChatSpeaker,
-    private readonly intentSink?: IntentSink
+    private readonly intentSink?: IntentSink,
+    private readonly history?: ChatHistory
   ) {
     this.ensureAutonomic()
-    // Start the loop immediately so the autonomic task runs from boot, before
-    // any player task arrives. queueMicrotask defers it past the constructor.
     queueMicrotask(() => { void this.pump() })
+  }
+
+  setAuto(auto: AutoHandle) {
+    this.auto = auto
+  }
+
+  queueLength(): number {
+    return this.queue.length
+  }
+
+  async runSubTask(sub: { rawRequest: string; plan?: Plan; progress: number }, signal: AbortSignal): Promise<void> {
+    const fake: QueuedTask = {
+      id: `sub-${Date.now().toString(36)}`,
+      rawRequest: sub.rawRequest,
+      username: this.bot.username,
+      priority: -5,
+      progress: sub.progress,
+      plan: sub.plan,
+      state: 'running',
+      controller: undefined
+    }
+    fake.controller = new AbortController()
+    const inner = fake.controller.signal
+    // Bridge the outer signal into the fake task's controller.
+    const onOuterAbort = () => fake.controller?.abort()
+    signal.addEventListener('abort', onOuterAbort, { once: true })
+    try {
+      await this.runTaskItem(fake)
+    } finally {
+      signal.removeEventListener('abort', onOuterAbort)
+    }
+    sub.progress = fake.progress
+    sub.plan = fake.plan
   }
 
   snapshot(): BodySnapshot {
@@ -134,10 +168,10 @@ export class BodyLoop {
     this.current?.controller?.abort()
     this.current = null
     this.ensureAutonomic()
+    this.auto?.stop()
     stopAllMovement(this.bot)
   }
 
-  /** Guarantee the autonomic task exists at the tail of the queue. */
   private ensureAutonomic() {
     if (this.queue.some(t => t.id === AUTONOMIC_TASK_ID)) return
     this.queue.push({
@@ -165,19 +199,30 @@ export class BodyLoop {
     this.running = true
     try {
       while (true) {
-        this.ensureAutonomic() // fallback: never let the queue empty out
+        this.ensureAutonomic()
         this.preempt = false
         const head = this.queue[0]
         this.current = head
 
         if (head.id === AUTONOMIC_TASK_ID) {
           this.current = null
-          const now = Date.now()
-          if (now - this.lastAutonomicLog > AUTONOMIC_LOG_INTERVAL_MS) {
-            this.lastAutonomicLog = now
-            log.info('[autonomic] idle — no tasks queued, running self-maintenance tick')
+          if (!this.auto) {
+            await new Promise(r => setTimeout(r, 500))
+            continue
           }
-          await new Promise(r => setTimeout(r, 500))
+          if (this.queue.length > 1) {
+            this.auto.suspend()
+            await new Promise(r => setTimeout(r, 200))
+            continue
+          }
+          head.controller = new AbortController()
+          try {
+            await this.auto.run(head.controller.signal)
+          } catch (error) {
+            if (!(error instanceof TaskCancelledError)) log.warn('[autonomic] error', error)
+          } finally {
+            head.controller = undefined
+          }
           continue
         }
 
@@ -189,7 +234,8 @@ export class BodyLoop {
           head.state = 'done'
         } catch (error) {
           if (error instanceof TaskCancelledError) {
-            head.state = head.state === 'suspended' ? 'suspended' : 'cancelled'
+            const s: QueuedTask['state'] = head.state
+            head.state = (s as QueuedTask['state']) === 'suspended' ? 'suspended' : 'cancelled'
           } else {
             log.error(`[task ${head.id}] failed`, error)
             head.state = 'failed'
@@ -201,6 +247,7 @@ export class BodyLoop {
             const idx = this.queue.findIndex(t => t.id === head.id)
             if (idx !== -1) this.queue.splice(idx, 1)
             log.info(`[task ${head.id}] removed (state=${head.state})`)
+            this.history?.add('system', 'sbot', `finished task: ${head.rawRequest}`)
           } else if (head.state === 'suspended') {
             log.info(`[task ${head.id}] suspended at step ${head.progress}/${head.plan?.tasks.length ?? '?'}`)
             head.state = 'queued'
@@ -273,8 +320,6 @@ export class BodyLoop {
     const summary = plan.tasks.map(s => `[${s.id}] ${results.get(s.id) ?? 'skipped'}`).join(' | ').slice(0, 240)
     log.info(`[task ${task.id}] summary: ${summary}`)
 
-    // Task finished: hand a short PURPOSE to the language loop. It writes the
-    // actual line from the recent chat, so we never repeat the summary verbatim.
     if (this.intentSink) {
       const anyBad = [...results.values()].some(r => r.startsWith('failed') || r.startsWith('partial') || r.startsWith('needs_revision'))
       this.intentSink({
@@ -291,23 +336,21 @@ export class BodyLoop {
     const executePrompt = buildSystemPrompt(this.bot.username, this.registry, renderGuideSections(step.guide_sections))
     let searchTarget: string | null = null
     const stepText = `${step.description}\n\nDone when: ${step.done_when}${step.needs.length > 0 ? `\nItems needed: ${step.needs.join(', ')}` : ''}`
-    const userMessage = { role: 'user' as const, content: buildUserMessage(parent.username, stepText, describeWorldState(this.bot, searchTarget)) }
-    const messages = [{ role: 'system' as const, content: executePrompt }, userMessage]
+    const userMessage: Message = { role: 'user', content: buildUserMessage(parent.username, stepText, describeWorldState(this.bot, searchTarget)) }
+    const messages: Message[] = [{ role: 'system', content: executePrompt }, userMessage]
 
-    // Task mode cannot use `say`; it must request a chat via the language loop.
     const tools = this.registry.toOllamaTools().filter(t => t.function.name !== 'say')
     tools.push({
       type: 'function',
       function: {
         name: 'request_chat',
-        description:
-          'Ask the language loop to say something to the player. Describe WHY and WHAT, not the exact words. Non-blocking.',
+        description: 'Ask the language loop to say something to the player. Describe WHY and WHAT, not the exact words. Non-blocking.',
         parameters: {
           type: 'object',
           required: ['reason', 'intent'],
           properties: {
-            reason: { type: 'string', description: 'Why you need to speak (e.g. "got stuck", "found an obstacle")' },
-            intent: { type: 'string', description: 'What to convey, in a short summary' }
+            reason: { type: 'string', description: 'Why you need to speak' },
+            intent: { type: 'string', description: 'What to convey, short summary' }
           }
         }
       }

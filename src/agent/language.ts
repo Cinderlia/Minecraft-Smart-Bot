@@ -137,7 +137,7 @@ export class LanguageLoop {
     }
   }
 
-  private buildTools() {
+  private buildTools(): any[] {
     return [
       {
         type: 'function' as const,

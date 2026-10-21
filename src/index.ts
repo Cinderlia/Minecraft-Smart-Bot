@@ -1,8 +1,8 @@
 import { loader as pathfinderLoader } from '@miner-org/mineflayer-baritone'
 import { BodyLoop, IntentSink } from './agent/body.js'
-import { ChatSpeaker } from './agent/chat.js'
 import { LanguageLoop } from './agent/language.js'
 import { LlmClient } from './agent/llm.js'
+import { AutoTask } from './bot/auto.js'
 import { enableAutoEat } from './bot/behaviors.js'
 import { configureMovements } from './bot/navigation.js'
 import { createBot } from './bot/createBot.js'
@@ -25,17 +25,17 @@ function main() {
 
   const bodyLlm = new LlmClient(config.llm)
   const languageLlm = new LlmClient(config.llm)
-  const chatLlm = new LlmClient(config.llm)
-  const speaker = new ChatSpeaker(bot, chatLlm, history)
+  const autoLlm = new LlmClient(config.llm)
 
-  // Deferred wiring: body needs an intent sink that calls language, language needs body.
   let language: LanguageLoop
   const intentSink: IntentSink = (intent) => {
     if (language) void language.forceReply(intent).catch(err => log.error('forceReply failed', err))
   }
 
-  const body = new BodyLoop(bot, registry, bodyLlm, config.agent, speaker, intentSink)
+  const body = new BodyLoop(bot, registry, bodyLlm, config.agent, intentSink, history)
   language = new LanguageLoop(bot, languageLlm, body, history)
+  const auto = new AutoTask(bot, autoLlm, body, history, config.owners.minecraft)
+  body.setAuto(auto)
 
   log.info(`Loaded ${registry.list().length} tools; model ${config.llm.model}`)
 
@@ -45,8 +45,6 @@ function main() {
     if (config.agent.autoEat) enableAutoEat(bot, () => body.busy)
 
     listenForOwnerMessages(bot, config.owners, ({ source, username, message }) => {
-      // Player messages are recorded by attachChatHistory via bot.on('chat');
-      // just route to the language loop.
       log.info(`[${source}] ${username}: ${message}`)
       void language.handle(username, message).catch(err => log.error('language loop failed', err))
     })

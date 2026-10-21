@@ -1,16 +1,19 @@
 import { Bot } from 'mineflayer'
 import { stopAllMovement } from '../bot/navigation.js'
+import { describeWorldState } from '../bot/status.js'
 import { Config } from '../config.js'
 import { ToolRegistry } from '../tools/registry.js'
 import { TaskCancelledError, errorMessage } from '../util/async.js'
 import { createLogger } from '../util/logger.js'
 import { LlmClient, Message } from './llm.js'
-import { buildSystemPrompt, buildUserMessage, guideCatalog, renderGuideSections } from './prompt.js'
-import { describeSurroundings, describeWorldState } from '../bot/status.js'
+import { Plan, PlannedTask, planTask } from './planner.js'
+import { buildSystemPrompt, buildUserMessage, renderGuideSections } from './prompt.js'
 
 const log = createLogger('agent')
 const maxToolOutput = 2000
 const historyTurns = 6
+/** Max LLM steps allowed per planned task, before the loop is cut. */
+const maxStepsPerTask = 15
 
 /** Tools whose `block` argument sets the active search target for surroundings. */
 const SEARCH_TOOLS = new Set(['find_blocks', 'collect_block', 'go_to_block', 'find_block_cells'])
@@ -21,8 +24,6 @@ export class Agent {
   private readonly queue: AgentRequest[] = []
   private readonly history: Message[] = []
   private controller: AbortController | null = null
-  /** Selection-stage prompt: rules + catalog + guide heading list, no guide bodies. */
-  private selectPrompt: string | null = null
 
   constructor(
     private readonly bot: Bot,
@@ -74,42 +75,66 @@ export class Agent {
 
   private async run(request: AgentRequest, signal: AbortSignal) {
     log.info(`${request.username}: ${request.message}`)
-    this.selectPrompt ??= buildSystemPrompt(this.bot.username, this.registry, guideCatalog())
+
+    let plan: Plan
+    try {
+      plan = await planTask(this.bot, this.llm, this.registry, request)
+    } catch (error) {
+      if (signal.aborted) throw new TaskCancelledError()
+      log.error('Planner failed', error)
+      this.bot.chat(`Could not plan that: ${errorMessage(error).slice(0, 120)}`)
+      this.remember(request, '')
+      return
+    }
+
+    log.info(`Plan: ${plan.goal} — ${plan.tasks.length} task(s)`)
+    for (const t of plan.tasks) {
+      log.info(`  [${t.id}] ${t.description} | done_when: ${t.done_when} | needs: ${t.needs.join(', ') || '-'}`)
+    }
+
+    const results: string[] = []
+    for (const task of plan.tasks) {
+      if (signal.aborted) throw new TaskCancelledError()
+      log.info(`--- Task ${task.id}: ${task.description}`)
+      const outcome = await this.runTask(task, request, signal)
+      results.push(`[${task.id}] ${outcome}`)
+    }
+
+    const summary = results.length > 0 ? results.join(' | ').slice(0, 240) : 'Done.'
+    this.bot.chat(summary)
+    this.remember(request, summary)
+  }
+
+  /** Execute a single planned task with the standard tool loop. */
+  private async runTask(task: PlannedTask, request: AgentRequest, signal: AbortSignal): Promise<string> {
+    const executePrompt = buildSystemPrompt(
+      this.bot.username,
+      this.registry,
+      renderGuideSections(task.guide_sections)
+    )
 
     let searchTarget: string | null = null
+    const taskText = `${task.description}\n\nDone when: ${task.done_when}${task.needs.length > 0 ? `\nItems needed: ${task.needs.join(', ')}` : ''}`
     const userMessage: Message = {
       role: 'user',
-      content: buildUserMessage(request.username, request.message, describeWorldState(this.bot, searchTarget))
+      content: buildUserMessage(request.username, taskText, describeWorldState(this.bot, searchTarget))
     }
     const messages: Message[] = [
-      { role: 'system', content: this.selectPrompt },
+      { role: 'system', content: executePrompt },
       ...this.history,
       userMessage
     ]
     const tools = this.registry.toOllamaTools()
     const ctx = { bot: this.bot, signal, log, requester: request.username }
 
-    let chosenSections: string[] = []
     let reply = ''
     let step = 0
-    let switched = false
 
-    for (; step < this.config.maxSteps; step++) {
-      if (step === 1 && !switched) {
-        const executePrompt = buildSystemPrompt(
-          this.bot.username,
-          this.registry,
-          renderGuideSections(chosenSections)
-        )
-        messages[0] = { role: 'system', content: executePrompt }
-        switched = true
-        log.info(`Guide sections loaded: ${chosenSections.join(', ') || 'FULL (model did not call select_guide)'}`)
-      }
-
-      // Refresh the user message so the model sees current surroundings every turn.
+    for (; step < maxStepsPerTask; step++) {
+      // Refresh the user message so the model sees current surroundings each turn.
       userMessage.content = buildUserMessage(
         request.username,
-        request.message,
+        taskText,
         describeWorldState(this.bot, searchTarget)
       )
 
@@ -126,18 +151,15 @@ export class Agent {
       for (const call of calls) {
         const name = call.function.name
         if (name === 'select_guide') {
-          const raw = String((call.function.arguments as any)?.sections ?? '')
-          chosenSections = raw.split(',').map(s => s.trim()).filter(Boolean)
-          log.info(`LLM selected guide sections: ${chosenSections.join(', ') || '(none)'}`)
+          // Planner already chose guide sections; ignore stray select_guide calls.
           messages.push({
             role: 'tool',
             tool_name: name,
-            content: `Loaded guide sections: ${chosenSections.join(', ') || '(none — full guide will be used)'}`
+            content: `Guide sections are fixed by the planner: ${task.guide_sections.join(', ') || 'none'}.`
           })
           continue
         }
 
-        // Track the active search target so surroundings include the nearest blocks.
         const args = (call.function.arguments ?? {}) as Record<string, unknown>
         if (SEARCH_TOOLS.has(name) && typeof args.block === 'string' && args.block.trim()) {
           searchTarget = args.block.trim()
@@ -153,11 +175,11 @@ export class Agent {
       }
     }
 
-    if (step >= this.config.maxSteps) {
-      reply = `I stopped after ${this.config.maxSteps} steps without finishing. Tell me how to continue.`
+    if (step >= maxStepsPerTask && !reply) {
+      reply = `stopped after ${maxStepsPerTask} steps`
+      log.info(`Task ${task.id} hit maxStepsPerTask without a final reply`)
     }
-    if (reply) this.bot.chat(reply.slice(0, 256))
-    this.remember(request, reply)
+    return reply || 'done'
   }
 
   private remember(request: AgentRequest, reply: string) {

@@ -5,6 +5,7 @@ import { Config } from '../config.js'
 import { ToolRegistry } from '../tools/registry.js'
 import { TaskCancelledError, errorMessage } from '../util/async.js'
 import { createLogger } from '../util/logger.js'
+import { ChatSpeaker } from './chat.js'
 import { LlmClient, Message } from './llm.js'
 import { Plan, PlannedTask, planTask } from './planner.js'
 import { Verdict, verifyTask } from './verifier.js'
@@ -27,22 +28,31 @@ export class Agent {
   private readonly queue: AgentRequest[] = []
   private readonly history: Message[] = []
   private controller: AbortController | null = null
+  /** Human-readable description of the task currently running, for chat context. */
+  private currentTaskText: string | null = null
 
   constructor(
     private readonly bot: Bot,
     private readonly registry: ToolRegistry,
     private readonly llm: LlmClient,
-    private readonly config: Config['agent']
+    private readonly config: Config['agent'],
+    private readonly speaker?: ChatSpeaker
   ) {}
 
   get busy(): boolean {
     return this.controller !== null
   }
 
+  /** What the agent is doing right now, in plain words, or null when idle. */
+  currentTaskDescription(): string | null {
+    return this.currentTaskText
+  }
+
   submit(request: AgentRequest) {
     this.queue.push(request)
     if (this.busy) {
-      this.bot.chat(`Queued (${this.queue.length} waiting). Say "stop" to cancel the current task.`)
+      // Never announce queue status in chat from here; the caller routes it through ChatSpeaker.
+      log.info(`Queued (${this.queue.length} waiting): ${request.message}`)
       return
     }
     void this.drain()
@@ -54,6 +64,7 @@ export class Agent {
     this.controller?.abort()
     this.llm.abort()
     stopAllMovement(this.bot)
+    this.currentTaskText = null
     return hadWork
   }
 
@@ -68,10 +79,13 @@ export class Agent {
           log.info('Task cancelled')
         } else {
           log.error('Agent error', error)
-          this.bot.chat(`Something went wrong: ${errorMessage(error).slice(0, 120)}`)
+          // Report failures through the speaker when available, never raw logs.
+          if (this.speaker) this.speaker.speak(request.message, { busyWith: null, report: `Something went wrong: ${errorMessage(error).slice(0, 120)}` })
+          else this.bot.chat(`Something went wrong: ${errorMessage(error).slice(0, 120)}`)
         }
       } finally {
         this.controller = null
+        this.currentTaskText = null
       }
     }
   }
@@ -85,7 +99,8 @@ export class Agent {
     } catch (error) {
       if (signal.aborted) throw new TaskCancelledError()
       log.error('Planner failed', error)
-      this.bot.chat(`Could not plan that: ${errorMessage(error).slice(0, 120)}`)
+      if (this.speaker) this.speaker.speak(request.message, { busyWith: null, report: `Could not plan that: ${errorMessage(error).slice(0, 120)}` })
+      else this.bot.chat(`Could not plan that: ${errorMessage(error).slice(0, 120)}`)
       this.remember(request, '')
       return
     }
@@ -112,6 +127,7 @@ export class Agent {
       for (const task of ready) {
         if (signal.aborted) throw new TaskCancelledError()
         log.info(`--- Task ${task.id}: ${task.description}`)
+        this.currentTaskText = task.description
         const outcome = await this.runTask(task, request, signal)
         results.set(task.id, outcome)
         remaining.delete(task.id)
@@ -122,7 +138,18 @@ export class Agent {
       .map(t => `[${t.id}] ${results.get(t.id) ?? 'skipped'}`)
       .join(' | ')
       .slice(0, 240)
-    this.bot.chat(summary || 'Done.')
+
+    // Plans and step lists stay in the log; the human-facing summary goes through the speaker.
+    log.info(`Plan summary: ${summary}`)
+    if (this.speaker) {
+      const ok = [...results.values()].filter(r => !r.startsWith('failed') && !r.startsWith('partial') && !r.startsWith('needs_revision')).length
+      this.speaker.speak(request.message, {
+        busyWith: null,
+        report: plan.tasks.length <= 1 ? summary : `${ok}/${plan.tasks.length} steps finished. ${summary}`
+      })
+    } else {
+      this.bot.chat(summary || 'Done.')
+    }
     this.remember(request, summary)
   }
 

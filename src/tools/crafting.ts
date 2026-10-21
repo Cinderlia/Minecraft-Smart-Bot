@@ -1,7 +1,7 @@
 import { Bot } from 'mineflayer'
 import { Block } from 'prismarine-block'
 import { goals } from 'mineflayer-pathfinder'
-import { MissingMaterialError, allRecipesFor, describeMissing, ensureItem, ingredientsOf, planMaterials, rankRecipes } from '../bot/crafting.js'
+import { MissingMaterialError, allRecipesFor, describeMissing, ensureItem, ingredientsOf, listRecipes, planMaterials, rankRecipes } from '../bot/crafting.js'
 import { countItem, countItemId, describeInventoryChange, snapshotInventory } from '../bot/inventory.js'
 import { navigate } from '../bot/navigation.js'
 import { placeBlockNearby } from '../bot/placement.js'
@@ -89,7 +89,8 @@ export const craftingTools = [
     category,
     description:
       'Craft an item in ONE call: automatically crafts all intermediate parts (planks, sticks, ...) from raw materials ' +
-      'and finds, places or crafts a crafting table. Do not craft the parts yourself. If raw materials are missing it lists the total to gather.',
+      'and finds, places or crafts a crafting table. Do not craft the parts yourself. If raw materials are missing it lists the total to gather. ' +
+      'If you are unsure which recipe variant to use (wood types, alternatives), call list_recipes first to see all options.',
     params: {
       item: { type: 'string', description: 'Item to craft, e.g. "stone_pickaxe", "torch", "oak_planks"', required: true },
       count: { type: 'integer', description: 'Number of items to craft (default 1)' }
@@ -126,7 +127,8 @@ export const craftingTools = [
   defineTool({
     name: 'get_recipe',
     category,
-    description: 'Plan how to make an item: ingredients (with how many you have), crafting table need, smelting input, and the TOTAL raw materials still to gather. Use before multi-step crafting.',
+    description: 'Plan how to make an item: ingredients (with how many you have), crafting table need, smelting input, and the TOTAL raw materials still to gather. Use before multi-step crafting. ' +
+      'For a flat list of every possible recipe variant (including ones you cannot craft yet), use list_recipes.',
     params: {
       item: { type: 'string', description: 'Item name', required: true },
       count: { type: 'integer', description: 'How many you want (default 1); used to total up raw materials' }
@@ -148,6 +150,38 @@ export const craftingTools = [
 
       if (recipes.length > 0) lines.push(materialsAdvice(bot, item.id, args.int('count', 1, { min: 1, max: 256 })))
       return lines.length > 0 ? lines.join('\n') : `${item.name} cannot be crafted or smelted; gather, mine, or loot it.`
+    }
+  }),
+
+  defineTool({
+    name: 'list_recipes',
+    category,
+    description:
+      'List every crafting recipe for an item, including recipes the bot cannot craft yet (different wood types, alternative ingredients). ' +
+      'Use this to inspect alternatives before deciding what to gather or which variant to craft. ' +
+      'For "what do I still need to gather", use get_recipe instead. ' +
+      'For "just make it", use craft_item.',
+    params: {
+      item: { type: 'string', description: 'Item name or id (e.g. "diamond_pickaxe", "chest")', required: true },
+      limit: { type: 'integer', description: 'Max recipes to list (default 5, max 20)' }
+    },
+    async handler(args, { bot }) {
+      const raw = args.string('item').trim()
+      const item = bot.registry.itemsByName[raw] ?? bot.registry.items[Number(raw)]
+      if (!item) throw new ToolInputError(`Unknown item "${raw}"`)
+      const recipes = listRecipes(bot, item.id)
+      if (recipes.length === 0) {
+        const smelt = smeltingInputsFor(item.name)
+        const hint = smelt.length > 0 ? ` It is made by smelting ${smelt.slice(0, 3).join(' / ')} (use smelt_item).` : ' It must be gathered, mined, or looted.'
+        return `No crafting recipe for ${item.name}.${hint}`
+      }
+      const limit = args.int('limit', 5, { min: 1, max: 20 })
+      const lines = recipes.slice(0, limit).map((r, i) => {
+        const ings = r.ingredients.map(ing => `${ing.count}x ${ing.name}`).join(' + ')
+        return `${i}: ${ings} -> ${r.result.count}x ${r.result.name}${r.requiresTable ? ' (needs crafting table)' : ''}`
+      })
+      const more = recipes.length > limit ? `\n... and ${recipes.length - limit} more` : ''
+      return `${recipes.length} recipe(s) for ${item.name}:\n${lines.join('\n')}${more}`
     }
   }),
 

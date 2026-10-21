@@ -220,3 +220,21 @@ export function describeMissing(missing: Map<string, number>): string {
   }
   return [...merged.entries()].map(([name, count]) => `${count} ${name}`).join(', ')
 }
+
+export type RecipeSummary = {
+  ingredients: { name: string; count: number }[]
+  result: { name: string; count: number }
+  requiresTable: boolean
+}
+
+/** List every crafting recipe for an item, including ones the bot cannot craft yet. */
+export function listRecipes(bot: Bot, itemId: number): RecipeSummary[] {
+  return allRecipesFor(bot, itemId).map(r => ({
+    ingredients: ingredientsOf(bot, r).map(ing => ({ name: ing.name, count: ing.count })),
+    result: {
+      name: bot.registry.items[r.result.id]?.name ?? `#${r.result.id}`,
+      count: r.result.count
+    },
+    requiresTable: r.requiresTable
+  }))
+}
